@@ -96,7 +96,7 @@ namespace NXCustomViewDxfExporter
             "UGI_GDT_EXPORT_AS_BLOCK =YES\r\n" +
             "UGI_LAYER_MASK =1-256\r\n" +
             "UGI_LOAD_COMP = Load Components\r\n" +
-            "UGI_LOAD_OPTION = Load From Search Dirs\r\n" +
+            "UGI_LOAD_OPTION = Load From Assem Dir\r\n" +
             "UGI_LOAD_VER = Load Exact Version\r\n" +
             "UGI_PROC_ASSEM = Overwrite load_options.def values\r\n" +
             "UGI_SEARCH_DIRS ={PART_DIR}\r\n" +
@@ -648,10 +648,11 @@ namespace NXCustomViewDxfExporter
                 double sheetHeight;
                 SelectSheetSize(viewWidth, viewHeight, out sheetWidth, out sheetHeight);
 
-                // b. 図面シートの作成 (DrawingSheetBuilder使用)
-                DrawingSheetBuilder sheetBuilder = workPart.DrawingSheets.DrawingSheetBuilder(null);
-                sheetBuilder.Option = DrawingSheetBuilder.SheetOption.CustomSize;
+                // b. 図面シートの作成 (DraftingDrawingSheetBuilder使用 - ジャーナル準拠)
+                NXOpen.Drawings.DraftingDrawingSheet nullDraftingSheet = null;
+                var sheetBuilder = workPart.DraftingDrawingSheets.CreateDraftingDrawingSheetBuilder(nullDraftingSheet);
                 sheetBuilder.AutoStartViewCreation = false;
+                sheetBuilder.Option = DrawingSheetBuilder.SheetOption.CustomSize;
                 sheetBuilder.Height = sheetHeight;
                 sheetBuilder.Length = sheetWidth;
                 sheetBuilder.ScaleNumerator = 1.0;
@@ -663,21 +664,38 @@ namespace NXCustomViewDxfExporter
                 sheet = (DrawingSheet)sheetObj;
                 sheetBuilder.Destroy();
 
+                // ジャーナル準拠: テンプレートインスタンス化完了を通知
+                workPart.Drafting.SetTemplateInstantiationIsComplete(true);
+
                 // シートを開く
                 sheet.Open();
 
-                // c. ベースビューの配置
-                Point3d viewOrigin = new Point3d(sheetWidth / 2.0, sheetHeight / 2.0, 0.0);
+                // c. ベースビューの配置（ジャーナル準拠）
+                workPart.DraftingManager.DrawingsFreezeOutOfDateComputation();
 
-                BaseViewBuilder baseViewBuilder = workPart.DraftingViews.CreateBaseViewBuilder(null);
+                NXOpen.Drawings.BaseView nullBaseView = null;
+                BaseViewBuilder baseViewBuilder = workPart.DraftingViews.CreateBaseViewBuilder(nullBaseView);
+
+                baseViewBuilder.Placement.Associative = true;
+
+                // カスタムビューを選択
                 baseViewBuilder.SelectModelView.SelectedView = view;
-                baseViewBuilder.Placement.Placement.SetValue(null, workPart.Views.WorkView, viewOrigin);
-                baseViewBuilder.Scale.Denominator = 1.0;
-                baseViewBuilder.Scale.Numerator = 1.0;
+
+                baseViewBuilder.SecondaryComponents.ObjectType =
+                    NXOpen.Drawings.DraftingComponentSelectionBuilder.Geometry.PrimaryGeometry;
+
+                // ★重要: PartNameに元パートのフルパスを明示的に設定（参照解決に必要）
+                baseViewBuilder.Style.ViewStyleBase.Part = workPart;
+                baseViewBuilder.Style.ViewStyleBase.PartName = workPart.FullPath;
+
+                // ジャーナル準拠: PartName設定後にビューを再選択
+                baseViewBuilder.SelectModelView.SelectedView = view;
 
                 // ビューがシートに収まるようスケール調整
                 double availableWidth = sheetWidth - (SheetMargin * 2);
                 double availableHeight = sheetHeight - (SheetMargin * 2);
+                baseViewBuilder.Scale.Denominator = 1.0;
+                baseViewBuilder.Scale.Numerator = 1.0;
                 if (viewWidth > 0 && viewHeight > 0)
                 {
                     double scaleX = availableWidth / viewWidth;
@@ -685,49 +703,53 @@ namespace NXCustomViewDxfExporter
                     double scale = Math.Min(scaleX, scaleY);
                     if (scale < 1.0)
                     {
-                        baseViewBuilder.Scale.Denominator = 1.0;
                         baseViewBuilder.Scale.Numerator = scale;
                     }
                 }
 
+                // 配置位置（シート中央）
+                Point3d viewOrigin = new Point3d(sheetWidth / 2.0, sheetHeight / 2.0, 0.0);
+                baseViewBuilder.Placement.Placement.SetValue(null, workPart.Views.WorkView, viewOrigin);
+
                 baseViewObj = baseViewBuilder.Commit();
+
+                workPart.DraftingManager.DrawingsUnfreezeOutOfDateComputation();
                 baseViewBuilder.Destroy();
 
-                // d. DXFエクスポート
+                // d. DXFエクスポート（ジャーナル準拠の順序）
                 string dxfFileName = string.Format("{0}_{1}.dxf", partName, view.Name);
                 string dxfFilePath = Path.Combine(outputFolder, dxfFileName);
 
                 DxfdwgCreator dxfCreator = theSession.DexManager.CreateDxfdwgCreator();
 
-                // ★ 最重要: 埋め込みdef設定を最初に読み込む（他のプロパティ設定より前）
+                // --- SettingsFileより前の初期設定（ジャーナル順序）---
+                dxfCreator.ExportData = DxfdwgCreator.ExportDataOption.Drawing;
+                dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2004;
+                dxfCreator.ViewEditMode = true;
+                dxfCreator.FlattenAssembly = true;
+                dxfCreator.ExportScaleValue = 1.0;
+
+                // --- dxfdwg.def設定ファイルの読み込み ---
                 dxfCreator.SettingsFile = tempDefPath;
 
-                // ★ 入力ファイルを明示的に指定（トランスレータがパートを見つけられるようにする）
+                // --- SettingsFile読み込み後の設定（defの値を上書き）---
+                dxfCreator.OutputTo = DxfdwgCreator.OutputToOption.Drafting;
+                dxfCreator.ObjectTypes.Curves = true;
+                dxfCreator.ObjectTypes.Annotations = true;
+                dxfCreator.ObjectTypes.Structures = true;
+                dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2018;
+                dxfCreator.FlattenAssembly = false;
+
+                // ★重要: InputFileに元パートのフルパスを設定（参照解決に必要）
                 dxfCreator.InputFile = workPart.FullPath;
 
-                dxfCreator.ExportFrom = DxfdwgCreator.ExportFromOption.DisplayPart;
-                dxfCreator.OutputFileType = DxfdwgCreator.OutputFileTypeOption.Dxf;
-                dxfCreator.ExportAs = DxfdwgCreator.ExportAsOption.TwoD;
-                dxfCreator.ProcessHoldFlag = true;
-                dxfCreator.FileSaveFlag = false;
-                dxfCreator.OutputTo = DxfdwgCreator.OutputToOption.Drafting;
-                dxfCreator.ExportData = DxfdwgCreator.ExportDataOption.Drawing;
                 dxfCreator.OutputFile = dxfFilePath;
 
-                // DXF/DWGリビジョン: 2018-2024（寸法・線種の正確な出力に必須）
-                dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2018;
-
-                // 寸法・注記を含める（寸法線の欠落防止）
-                dxfCreator.ObjectTypes.Annotations = true;
-                dxfCreator.ObjectTypes.Curves = true;
-                dxfCreator.ObjectTypes.Solids = true;
-
-                // 全レイヤーをエクスポート対象にする（寸法レイヤーの除外を防止）
+                // --- Commit直前の最終設定 ---
+                dxfCreator.WidthFactorMode = DxfdwgCreator.WidthfactorMethodOptions.AutomaticCalculation;
                 dxfCreator.LayerMask = "1-256";
-
-                // 図面シートを選択
-                dxfCreator.ExportSelectionBlock.SelectionScope = ObjectSelector.Scope.SelectedObjects;
-                dxfCreator.ExportSelectionBlock.SelectionComp.Add(sheet);
+                dxfCreator.DrawingList = @"""Sheet 1""";
+                dxfCreator.ProcessHoldFlag = true;
 
                 dxfCreator.Commit();
                 dxfCreator.Destroy();
