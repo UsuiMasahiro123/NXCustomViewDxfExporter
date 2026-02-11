@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using NXOpen;
 using NXOpen.Drawings;
@@ -305,7 +306,10 @@ namespace NXCustomViewDxfExporter
             // CGM環境変数の元の値を退避
             string originalCgmEnv = Environment.GetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE");
 
-            Session.UndoMarkId undoMark = theSession.SetUndoMark(Session.MarkVisibility.Visible, "DXF Export");
+            // 二重呼び出し防止フラグ
+            bool displaySuppressed = false;
+            bool undoMarkCreated = false;
+            Session.UndoMarkId undoMark = default(Session.UndoMarkId);
 
             int successCount = 0;
             int failCount = 0;
@@ -389,40 +393,37 @@ namespace NXCustomViewDxfExporter
                 // 7. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
                 theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
 
-                // 8. NXウィンドウを最小化
+                // 8. UndoMark作成（製図変更開始直前、早期returnでは作成しない）
+                undoMark = theSession.SetUndoMark(Session.MarkVisibility.Invisible, "DXF Export");
+                undoMarkCreated = true;
+
+                // 9. 情報ウィンドウを閉じてからNXウィンドウを最小化
+                lw.Close();
                 ShowWindow(nxMainWindow, SW_MINIMIZE);
 
-                // 9. フォーカスロック
+                // 10. フォーカスロック
                 try
                 {
                     LockSetForegroundWindow(LSFW_LOCK);
                 }
                 catch { }
 
-                // 10. 画面更新を抑制
-                try
-                {
-                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
-                    lw.WriteLine(GetMessage("LwDisplaySuppressed"));
-                }
-                catch (Exception ex)
-                {
-                    lw.WriteLine(GetMessage("LwDisplaySuppressFailed", ex.Message));
-                }
+                // 11. 画面更新を抑制
+                theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
+                displaySuppressed = true;
 
-                // 11. 進捗ダイアログを表示（メインスレッド）
+                // 12. 進捗ダイアログを表示（メインスレッド）
                 progressForm = new ProgressForm(customViews.Count);
                 progressForm.Show();
                 Application.DoEvents();
 
-                // 12. カスタムビューごとのループ処理
+                // 13. カスタムビューごとのループ処理
                 for (int i = 0; i < customViews.Count; i++)
                 {
                     // 中断チェック
                     if (progressForm.StopRequested)
                     {
                         cancelCount = customViews.Count - i;
-                        lw.WriteLine("\n" + GetMessage("UserStopped"));
                         break;
                     }
 
@@ -432,15 +433,12 @@ namespace NXCustomViewDxfExporter
                     progressForm.UpdateProgress(view.Name, i + 1, customViews.Count);
                     Application.DoEvents();
 
-                    lw.WriteLine(GetMessage("LwProcessing", i + 1, customViews.Count, view.Name));
-
                     Stopwatch viewSw = Stopwatch.StartNew();
                     try
                     {
                         ExportViewAsDxf(view, partName, outputFolder);
                         viewSw.Stop();
                         successCount++;
-                        lw.WriteLine(GetMessage("LwSuccess", viewSw.Elapsed.TotalSeconds));
                     }
                     catch (Exception ex)
                     {
@@ -448,96 +446,128 @@ namespace NXCustomViewDxfExporter
                         failCount++;
                         string errorMsg = string.Format("{0}: {1}", view.Name, ex.Message);
                         errorDetails.Add(errorMsg);
-                        lw.WriteLine(GetMessage("LwFailed", viewSw.Elapsed.TotalSeconds, ex.Message));
-                        theSession.LogFile.WriteLine(GetMessage("LwViewExportFailed", view.Name, ex.Message));
                     }
 
                     Application.DoEvents();
                 }
 
-                // 13. 進捗ダイアログを閉じる
-                progressForm.Close();
-                progressForm.Dispose();
-                progressForm = null;
+                // === ループ終了後のクリーンアップ（順序が重要！） ===
 
-                // 14. 画面更新を復帰
-                try
+                // Step 1: 進捗ダイアログを閉じる
+                if (progressForm != null)
+                {
+                    progressForm.Close();
+                    progressForm.Dispose();
+                    progressForm = null;
+                }
+
+                // Step 2: 画面更新を復帰（完了ダイアログ表示前に必ず）
+                if (displaySuppressed)
                 {
                     theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
-                    lw.WriteLine(GetMessage("LwDisplayRestored"));
-                }
-                catch (Exception ex)
-                {
-                    lw.WriteLine(GetMessage("LwDisplayRestoreFailed", ex.Message));
+                    displaySuppressed = false;
+                    Thread.Sleep(100);
                 }
 
-                // 15. モデリングアプリケーションに戻る
+                // Step 3: UndoMarkで状態を復元（完了ダイアログ表示前に）
+                SafeUndoAndCleanup(theSession, ref undoMark, ref undoMarkCreated);
+
+                // Step 4: モデリングアプリケーションに戻る
                 try
                 {
                     theSession.ApplicationSwitchImmediate("UG_APP_MODELING");
                 }
-                catch
-                {
-                    // 既にモデリングの場合は無視
-                }
+                catch { }
 
-                // 16. リスティングウィンドウに結果を出力
+                // Step 5: リスティングウィンドウに結果を出力
                 totalSw.Stop();
-                lw.WriteLine("\n========================================");
-                lw.WriteLine("  " + GetMessage("ResultTitle"));
-                lw.WriteLine("========================================");
-                lw.WriteLine(GetMessage("SuccessCount", successCount));
-                if (failCount > 0)
-                    lw.WriteLine(GetMessage("FailureCount", failCount));
-                if (cancelCount > 0)
-                    lw.WriteLine(GetMessage("CancelCount", cancelCount));
-                lw.WriteLine(GetMessage("LwTotalTime", totalSw.Elapsed.TotalSeconds));
-                lw.WriteLine("========================================");
+                try
+                {
+                    lw.Open();
+                    lw.WriteLine("\n========================================");
+                    lw.WriteLine("  " + GetMessage("ResultTitle"));
+                    lw.WriteLine("========================================");
+                    lw.WriteLine(GetMessage("SuccessCount", successCount));
+                    if (failCount > 0)
+                        lw.WriteLine(GetMessage("FailureCount", failCount));
+                    if (cancelCount > 0)
+                        lw.WriteLine(GetMessage("CancelCount", cancelCount));
+                    lw.WriteLine(GetMessage("LwTotalTime", totalSw.Elapsed.TotalSeconds));
+                    lw.WriteLine("========================================");
+                }
+                catch { }
 
-                // 17. 完了ダイアログを表示（OKボタン押下後にNXウィンドウを復帰）
+                // Step 6: 完了ダイアログを表示
                 using (var completionForm = new CompletionForm(
                     successCount, failCount, cancelCount, errorDetails, outputFolder))
                 {
                     completionForm.ShowDialog();
                 }
+                // completionFormはここでDispose済み
             }
             catch (Exception ex)
             {
-                lw.WriteLine(GetMessage("FatalError", ex.Message));
-                theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
-                    GetMessage("UnexpectedError", ex.Message));
+                // 全ての例外をキャッチ（NXに伝播させない）
+                try
+                {
+                    if (progressForm != null)
+                    {
+                        progressForm.Close();
+                        progressForm.Dispose();
+                        progressForm = null;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    MessageBox.Show(
+                        GetMessage("UnexpectedError", ex.Message),
+                        GetMessage("Error"),
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                catch { }
             }
             finally
             {
-                // 進捗ダイアログが残っていたら閉じる
-                if (progressForm != null)
-                {
-                    try { progressForm.Close(); progressForm.Dispose(); }
-                    catch { }
-                }
-
-                // 画面更新を復帰（エラー時も確実に復帰）
+                // 確実に復帰（二重呼び出し防止のフラグ付き）
                 try
                 {
-                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                    if (progressForm != null)
+                    {
+                        progressForm.Close();
+                        progressForm.Dispose();
+                    }
                 }
                 catch { }
 
-                // NXウィンドウを復帰（完了ダイアログのOK押下後）
-                if (nxMainWindow != IntPtr.Zero)
-                {
-                    ShowWindow(nxMainWindow, SW_RESTORE);
-                }
-
-                // フォーカスロック解除
                 try
                 {
+                    if (displaySuppressed)
+                    {
+                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    SafeUndoAndCleanup(theSession, ref undoMark, ref undoMarkCreated);
+                }
+                catch { }
+
+                // NXウィンドウ復帰
+                try
+                {
+                    if (nxMainWindow != IntPtr.Zero)
+                    {
+                        ShowWindow(nxMainWindow, SW_RESTORE);
+                        Thread.Sleep(200);
+                    }
                     LockSetForegroundWindow(LSFW_UNLOCK);
                 }
                 catch { }
-
-                // UndoMarkまで戻す（図面シート等の変更を取り消す）
-                theSession.UndoToMark(undoMark, null);
 
                 // CGM環境変数を元に戻す
                 try
@@ -556,9 +586,35 @@ namespace NXCustomViewDxfExporter
 
                 // Tempにコピーしたパートファイルを削除
                 CleanupTempPartCopies();
-
-                // パートは絶対に保存しない（保存するとCGMダイアログの原因になる）
             }
+        }
+
+        // ================================================================
+        // UndoMark安全復元ヘルパー
+        // ================================================================
+
+        /// <summary>
+        /// UndoMarkの復元と削除を安全に1回だけ実行するヘルパー。
+        /// NX内部のDXFエクスポートがUndoMarkを無効化する場合があるため、
+        /// try-catchで保護し、二重実行を防止するためフラグをリセットする。
+        /// </summary>
+        private static void SafeUndoAndCleanup(Session session, ref Session.UndoMarkId undoMark, ref bool undoMarkCreated)
+        {
+            if (!undoMarkCreated) return;
+
+            try
+            {
+                session.UndoToMark(undoMark, "DXF Export");
+            }
+            catch (Exception) { /* NX内部でマークが無効化された場合は無視 */ }
+
+            try
+            {
+                session.DeleteUndoMark(undoMark, "DXF Export");
+            }
+            catch (Exception) { /* NX内部でマークが無効化された場合は無視 */ }
+
+            undoMarkCreated = false;
         }
 
         // ================================================================
@@ -1087,7 +1143,7 @@ namespace NXCustomViewDxfExporter
             public CompletionForm(int successCount, int failCount, int cancelCount,
                 List<string> errors, string outputPath)
             {
-                bool hasErrors = failCount > 0 || cancelCount > 0;
+                bool hasErrors = failCount > 0;
 
                 this.Text = hasErrors ? GetMessage("CompleteTitleError") : GetMessage("CompleteTitleSuccess");
                 this.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1105,12 +1161,10 @@ namespace NXCustomViewDxfExporter
                 if (hasErrors)
                 {
                     labelStatus.Text = "\u26A0 " + GetMessage("CompleteMessageError");
-                    labelStatus.ForeColor = Color.FromArgb(255, 152, 0);
                 }
                 else
                 {
                     labelStatus.Text = "\u2713 " + GetMessage("CompleteMessage");
-                    labelStatus.ForeColor = Color.FromArgb(40, 167, 69);
                 }
                 labelStatus.Location = new System.Drawing.Point(20, y);
                 labelStatus.Size = new System.Drawing.Size(400, 30);
@@ -1123,7 +1177,6 @@ namespace NXCustomViewDxfExporter
                 labelSuccess.Text = GetMessage("SuccessCount", successCount);
                 labelSuccess.Location = new System.Drawing.Point(30, y);
                 labelSuccess.Size = new System.Drawing.Size(380, 22);
-                labelSuccess.ForeColor = Color.FromArgb(40, 167, 69);
                 labelSuccess.Font = GetUIFont(10f);
                 this.Controls.Add(labelSuccess);
                 y += 25;
@@ -1135,7 +1188,6 @@ namespace NXCustomViewDxfExporter
                     labelFail.Text = GetMessage("FailureCount", failCount);
                     labelFail.Location = new System.Drawing.Point(30, y);
                     labelFail.Size = new System.Drawing.Size(380, 22);
-                    labelFail.ForeColor = Color.FromArgb(220, 53, 69);
                     labelFail.Font = GetUIFont(10f);
                     this.Controls.Add(labelFail);
                     y += 25;
@@ -1148,7 +1200,6 @@ namespace NXCustomViewDxfExporter
                     labelCancel.Text = GetMessage("CancelCount", cancelCount);
                     labelCancel.Location = new System.Drawing.Point(30, y);
                     labelCancel.Size = new System.Drawing.Size(380, 22);
-                    labelCancel.ForeColor = Color.FromArgb(255, 152, 0);
                     labelCancel.Font = GetUIFont(10f);
                     this.Controls.Add(labelCancel);
                     y += 25;
@@ -1180,7 +1231,6 @@ namespace NXCustomViewDxfExporter
                         labelError.Text = "  " + error;
                         labelError.Location = new System.Drawing.Point(30, y);
                         labelError.Size = new System.Drawing.Size(380, 40);
-                        labelError.ForeColor = Color.FromArgb(220, 53, 69);
                         labelError.Font = GetUIFont(9f);
                         this.Controls.Add(labelError);
                         y += 40;
@@ -1205,8 +1255,7 @@ namespace NXCustomViewDxfExporter
 
                 y += 55;
 
-                this.Width = 450;
-                this.Height = y;
+                this.ClientSize = new System.Drawing.Size(430, y);
             }
         }
     }
