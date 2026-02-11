@@ -310,10 +310,64 @@ public static int GetUnloadOption(string dummy)
 }
 ```
 
-## エラーハンドリング
-- 各ステップでtry-catchを使用
-- エラー発生時はNXMessageBoxでエラー内容を表示
-- エラーが発生しても、可能な限り次のビューの処理を継続（スキップして続行）
+## エラーハンドリング（重要）
+- **処理全体をtry-finally で囲み、中断・エラー時も必ずクリーンアップを行うこと**
+- 以下のクリーンアップは**どんな場合でも**実行されなければならない:
+  1. 画面更新の復帰: `SetDisplay(UNSUPPRESS_DISPLAY)`
+  2. フォーカスロック解除: `LockSetForegroundWindow(LSFW_UNLOCK)`
+  3. UndoMarkによる状態復元
+  4. 一時defファイルの削除
+
+```csharp
+// 全体構造の例
+bool displaySuppressed = false;
+bool focusLocked = false;
+try
+{
+    // 画面更新を抑制
+    theUfSession.Disp.SetDisplay(UF_DISP_SUPPRESS_DISPLAY);
+    displaySuppressed = true;
+    
+    // フォーカスロック
+    LockSetForegroundWindow(LSFW_LOCK);
+    focusLocked = true;
+    
+    // === カスタムビューのループ処理 ===
+    foreach (var view in customViews)
+    {
+        try
+        {
+            // 個別ビューの処理（シート作成→ベースビュー→DXF→削除）
+        }
+        catch (Exception ex)
+        {
+            // このビューをスキップして次へ続行
+            failCount++;
+        }
+    }
+}
+catch (Exception ex)
+{
+    // 全体的なエラー
+    NXMessageBox.Show("エラー", ...);
+}
+finally
+{
+    // ★ どんな場合でも必ず実行 ★
+    if (displaySuppressed)
+    {
+        try { theUfSession.Disp.SetDisplay(UF_DISP_UNSUPPRESS_DISPLAY); } catch { }
+    }
+    if (focusLocked)
+    {
+        try { LockSetForegroundWindow(LSFW_UNLOCK); } catch { }
+    }
+    try { theSession.UndoToMark(undoMark, null); } catch { }
+    try { File.Delete(tempDefPath); } catch { }
+}
+```
+
+- 各ビューの処理は個別にtry-catchで囲み、1つのビューが失敗しても次のビューの処理を継続
 - 最終的に処理結果サマリーを表示（成功数/失敗数）
 
 ## 注意事項
@@ -328,42 +382,117 @@ public static int GetUnloadOption(string dummy)
 - CGM保存ダイアログが出る場合は環境変数 `UGII_CGM_FITS_FILE_SAVE=0` で抑制すること
 
 ## バックグラウンド処理（重要）
-変換処理中もユーザーが同じPC上で他の作業（メモ帳でのテキスト入力等）を継続できるようにすること。現状、NXウィンドウがたびたびアクティブ（前面）になり、他のアプリケーションでの作業が中断される問題がある。
+変換処理中もユーザーが同じPC上で他の作業（メモ帳でのテキスト入力等）を継続できるようにすること。NXウィンドウがたびたびアクティブ（前面）になり、他のアプリケーションでの作業が中断される問題がある。
 
-### 必須対策
+### 原因分析（動画キャプチャから判明）
+NXは以下のタイミングで前面に来る:
+- 図面シートの作成/Commit時
+- ベースビューの配置時
+- DXFエクスポート時（「作業進行中」ダイアログ）
+`LockSetForegroundWindow` だけでは不十分。NXは `SetForegroundWindow` 以外のメカニズムでもウィンドウをアクティブ化する。
+
+### 必須対策: アクティブフォーカス復元方式
 以下の全てを実装すること:
 
 1. **画面更新の抑制**
    - ループ処理の開始前に `theUfSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY)` で画面更新を停止
    - ループ処理の完了後に `theUfSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY)` で画面更新を復帰
-   - これにより、シート作成・ビュー配置・削除のたびにNXウィンドウが再描画されるのを防ぐ
 
-2. **NXウィンドウがフォーカスを奪わないようにする**
-   - NXウィンドウの自動的な前面化（アクティブ化）を防止する
-   - **NXウィンドウの最小化・最大化はしない**（ユーザーが自由に操作できるようにする）
-   - Win32 API を使用してフォーカス奪取のみを制御:
+2. **フォーカスロック（補助）**
    ```csharp
    [DllImport("user32.dll")]
    static extern bool LockSetForegroundWindow(uint uLockCode);
    const uint LSFW_LOCK = 1;
    const uint LSFW_UNLOCK = 2;
    ```
-   - 処理開始前: `LockSetForegroundWindow(LSFW_LOCK)` でNXが前面に来るのを防止
-   - 処理完了後: `LockSetForegroundWindow(LSFW_UNLOCK)` でロック解除
-   - ユーザーは処理中も自由にNXウィンドウを最小化・最大化・移動できる
 
-3. **ビューの更新を抑制**
-   - `theSession.SetUndoMarkVisibility()` でアンドゥマークの可視性を制御
-   - ステータスバーへの進捗表示のみ行い、画面描画は抑制
+3. **★ アクティブフォーカス復元（主対策）★**
+   NX操作のたびに、処理開始前にアクティブだったウィンドウにフォーカスを戻す:
+   ```csharp
+   [DllImport("user32.dll")]
+   static extern IntPtr GetForegroundWindow();
+   
+   [DllImport("user32.dll")]
+   static extern bool SetForegroundWindow(IntPtr hWnd);
+   
+   [DllImport("user32.dll")]
+   static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+   
+   [DllImport("user32.dll")]
+   static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+   
+   [DllImport("kernel32.dll")]
+   static extern uint GetCurrentThreadId();
+   ```
+   
+   **フォーカス復元ヘルパーメソッド:**
+   ```csharp
+   static void RestoreFocus(IntPtr targetWindow)
+   {
+       if (targetWindow == IntPtr.Zero) return;
+       
+       // 現在のフォアグラウンドウィンドウのスレッドにアタッチしてからSetForegroundWindow
+       IntPtr currentForeground = GetForegroundWindow();
+       if (currentForeground == targetWindow) return;
+       
+       uint currentThreadId = GetCurrentThreadId();
+       uint foregroundThreadId = GetWindowThreadProcessId(currentForeground, out _);
+       
+       bool attached = false;
+       if (currentThreadId != foregroundThreadId)
+       {
+           attached = AttachThreadInput(currentThreadId, foregroundThreadId, true);
+       }
+       
+       try
+       {
+           SetForegroundWindow(targetWindow);
+       }
+       finally
+       {
+           if (attached)
+           {
+               AttachThreadInput(currentThreadId, foregroundThreadId, false);
+           }
+       }
+   }
+   ```
+   
+   **使用箇所:**
+   ```csharp
+   // ループ開始前にユーザーのアクティブウィンドウを記憶
+   IntPtr userWindow = GetForegroundWindow();
+   
+   foreach (var view in customViews)
+   {
+       // シート作成
+       draftingDrawingSheetBuilder.Commit();
+       RestoreFocus(userWindow);
+       
+       // ベースビュー配置
+       baseViewBuilder.Commit();
+       RestoreFocus(userWindow);
+       
+       // DXFエクスポート
+       dxfdwgCreator.Commit();
+       RestoreFocus(userWindow);
+       
+       // シート削除
+       // ...削除処理...
+       RestoreFocus(userWindow);
+   }
+   ```
 
 ### 処理フローへの適用
 ```
 フォルダ選択ダイアログ表示 → ユーザー操作完了
 ↓
+ユーザーのアクティブウィンドウを記憶（GetForegroundWindow）
 画面更新を抑制（SetDisplay SUPPRESS）
 フォーカスロック（LockSetForegroundWindow LOCK）
 ↓
-カスタムビューのループ処理（NXが前面に来ない状態で実行）
+カスタムビューのループ処理:
+  各NX操作（Commit等）の直後にRestoreFocus()を呼び出し
 ↓
 画面更新を復帰（SetDisplay UNSUPPRESS）
 フォーカスロック解除（LockSetForegroundWindow UNLOCK）
@@ -374,7 +503,8 @@ public static int GetUnloadOption(string dummy)
 - 画面更新の抑制・復帰は必ずtry-finallyで囲み、エラー時も確実に復帰すること
 - フォーカスロック・解除も同様にtry-finallyで保護すること
 - NXウィンドウの最小化・最大化・移動はユーザーに委ねること（プログラムから操作しない）
-- 処理の進捗はNXのステータスバーまたはログ出力で確認可能にする
+- `RestoreFocus` は各Commit呼び出しの直後、および画面更新が発生しうる全ての箇所で呼び出すこと
+- `AttachThreadInput` は `SetForegroundWindow` を確実に動作させるために必要（別スレッドからのフォーカス変更を可能にする）
 
 ## 出力ファイル
 - プロジェクト名: `NXCustomViewDxfExporter`

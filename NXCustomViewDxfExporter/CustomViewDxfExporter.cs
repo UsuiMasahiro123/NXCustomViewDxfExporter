@@ -13,18 +13,26 @@ namespace NXCustomViewDxfExporter
 {
     public class CustomViewDxfExporter
     {
-        // Win32 API: フォーカス奪取を制御
+        // Win32 API: フォーカス制御
         [DllImport("user32.dll")]
         private static extern bool LockSetForegroundWindow(uint uLockCode);
         private const uint LSFW_LOCK = 1;
         private const uint LSFW_UNLOCK = 2;
 
-        // Win32 API: フォーカスの保存・復元
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
 
         private static Session theSession;
         private static UFSession theUFSession;
@@ -41,6 +49,10 @@ namespace NXCustomViewDxfExporter
         // 停止ボタン用フラグ
         private static volatile bool cancelRequested;
         private static Form cancelForm;
+
+        // フォーカス制御用
+        private static IntPtr nxMainWindow = IntPtr.Zero;
+        private static volatile IntPtr lastNonNxForeground = IntPtr.Zero;
 
         // dxfdwg.def 埋め込み内容（DLL経由エクスポート時の設定ズレを防止）
         private static readonly string EmbeddedDefContent =
@@ -226,7 +238,9 @@ namespace NXCustomViewDxfExporter
                 theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
 
                 // 8. バックグラウンド処理の開始
-                IntPtr userWindow = GetForegroundWindow();
+                // NXメインウィンドウのハンドルを取得（フォーカス監視用）
+                nxMainWindow = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle;
+                lastNonNxForeground = IntPtr.Zero;
 
                 try
                 {
@@ -241,7 +255,6 @@ namespace NXCustomViewDxfExporter
                 try
                 {
                     LockSetForegroundWindow(LSFW_LOCK);
-                    lw.WriteLine("[バックグラウンド] フォーカスロックを設定しました");
                 }
                 catch { }
 
@@ -283,13 +296,8 @@ namespace NXCustomViewDxfExporter
                                 string.Format("ビュー '{0}' のエクスポートに失敗: {1}", view.Name, ex.Message));
                         }
 
-                        // 各ビュー処理後にユーザーのウィンドウを前面に復帰
-                        try
-                        {
-                            if (userWindow != IntPtr.Zero)
-                                SetForegroundWindow(userWindow);
-                        }
-                        catch { }
+                        // 各ビュー処理後にフォーカスを復帰
+                        RestoreFocus();
                     }
                 }
                 finally
@@ -312,17 +320,11 @@ namespace NXCustomViewDxfExporter
                     try
                     {
                         LockSetForegroundWindow(LSFW_UNLOCK);
-                        lw.WriteLine("[バックグラウンド] フォーカスロックを解除しました");
                     }
                     catch { }
 
-                    // ユーザーのウィンドウを前面に復帰
-                    try
-                    {
-                        if (userWindow != IntPtr.Zero)
-                            SetForegroundWindow(userWindow);
-                    }
-                    catch { }
+                    // フォーカス監視を停止
+                    nxMainWindow = IntPtr.Zero;
                 }
 
                 // 11. モデリングアプリケーションに戻る
@@ -542,6 +544,33 @@ namespace NXCustomViewDxfExporter
                 };
                 form.Controls.Add(btn);
 
+                // フォーカス監視タイマー: NXが自動的にフォーカスを奪った場合に復元
+                System.Windows.Forms.Timer focusTimer = new System.Windows.Forms.Timer();
+                focusTimer.Interval = 100;
+                focusTimer.Tick += (s2, e2) =>
+                {
+                    try
+                    {
+                        IntPtr nxWnd = nxMainWindow;
+                        if (nxWnd == IntPtr.Zero) return;
+
+                        IntPtr fg = GetForegroundWindow();
+                        if (fg != IntPtr.Zero && fg != nxWnd && fg != form.Handle)
+                        {
+                            // NX以外のウィンドウがアクティブ → ユーザーの作業ウィンドウとして記憶
+                            lastNonNxForeground = fg;
+                        }
+                        else if (fg == nxWnd)
+                        {
+                            // NXがフォーカスを奪った → ユーザーのウィンドウに戻す
+                            RestoreFocus();
+                        }
+                    }
+                    catch { }
+                };
+                focusTimer.Start();
+                form.FormClosed += (s2, e2) => focusTimer.Dispose();
+
                 cancelForm = form;
                 Application.Run(form);
             });
@@ -584,6 +613,49 @@ namespace NXCustomViewDxfExporter
                     form.Invoke(new Action(() => form.Close()));
                 }
                 cancelForm = null;
+            }
+            catch { }
+        }
+
+        // ================================================================
+        // フォーカス復元（AttachThreadInput方式）
+        // ================================================================
+
+        /// <summary>
+        /// NXがフォーカスを奪った場合、ユーザーの作業ウィンドウにフォーカスを戻す。
+        /// AttachThreadInputで現在のフォアグラウンドスレッドにアタッチしてから
+        /// SetForegroundWindowを呼ぶことで、確実にフォーカスを変更する。
+        /// </summary>
+        private static void RestoreFocus()
+        {
+            try
+            {
+                IntPtr target = lastNonNxForeground;
+                if (target == IntPtr.Zero) return;
+
+                IntPtr currentForeground = GetForegroundWindow();
+                if (currentForeground == target) return;
+
+                uint currentThreadId = GetCurrentThreadId();
+                uint foregroundThreadId = GetWindowThreadProcessId(currentForeground, out _);
+
+                bool attached = false;
+                if (currentThreadId != foregroundThreadId)
+                {
+                    attached = AttachThreadInput(currentThreadId, foregroundThreadId, true);
+                }
+
+                try
+                {
+                    SetForegroundWindow(target);
+                }
+                finally
+                {
+                    if (attached)
+                    {
+                        AttachThreadInput(currentThreadId, foregroundThreadId, false);
+                    }
+                }
             }
             catch { }
         }
@@ -663,12 +735,14 @@ namespace NXCustomViewDxfExporter
                 NXObject sheetObj = sheetBuilder.Commit();
                 sheet = (DrawingSheet)sheetObj;
                 sheetBuilder.Destroy();
+                RestoreFocus();
 
                 // ジャーナル準拠: テンプレートインスタンス化完了を通知
                 workPart.Drafting.SetTemplateInstantiationIsComplete(true);
 
                 // シートを開く
                 sheet.Open();
+                RestoreFocus();
 
                 // c. ベースビューの配置（ジャーナル準拠）
                 workPart.DraftingManager.DrawingsFreezeOutOfDateComputation();
@@ -715,6 +789,7 @@ namespace NXCustomViewDxfExporter
 
                 workPart.DraftingManager.DrawingsUnfreezeOutOfDateComputation();
                 baseViewBuilder.Destroy();
+                RestoreFocus();
 
                 // d. DXFエクスポート（ジャーナル準拠の順序）
                 string dxfFileName = string.Format("{0}_{1}.dxf", partName, view.Name);
@@ -753,10 +828,12 @@ namespace NXCustomViewDxfExporter
 
                 dxfCreator.Commit();
                 dxfCreator.Destroy();
+                RestoreFocus();
 
                 // e. クリーンアップ：ビューとシートを削除
                 CleanupViewAndSheet(baseViewObj, sheet, viewUndoMark);
                 sheet = null;
+                RestoreFocus();
             }
             catch
             {
