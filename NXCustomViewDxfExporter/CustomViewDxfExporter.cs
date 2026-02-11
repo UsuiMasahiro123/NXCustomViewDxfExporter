@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Windows.Forms;
 using NXOpen;
@@ -14,6 +15,7 @@ namespace NXCustomViewDxfExporter
         private static UFSession theUFSession;
         private static UI theUI;
         private static Part workPart;
+        private static ListingWindow lw;
 
         // 標準ビュー名リスト（英語・日本語）
         private static readonly HashSet<string> StandardViewNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -43,6 +45,13 @@ namespace NXCustomViewDxfExporter
             theSession = Session.GetSession();
             theUFSession = UFSession.GetUFSession();
             theUI = UI.GetUI();
+            lw = theSession.ListingWindow;
+            lw.Open();
+
+            Stopwatch totalSw = Stopwatch.StartNew();
+
+            // CGM環境変数の元の値を退避
+            string originalCgmEnv = Environment.GetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE");
 
             Session.UndoMarkId undoMark = theSession.SetUndoMark(Session.MarkVisibility.Visible, "DXF Export");
 
@@ -60,36 +69,62 @@ namespace NXCustomViewDxfExporter
                     return;
                 }
 
+                // CGMダイアログ抑制（処理開始前に設定）
+                SuppressCgmDialog();
+
                 // パート名（拡張子なし）を取得
                 string partName = Path.GetFileNameWithoutExtension(workPart.FullPath);
+                lw.WriteLine("========================================");
+                lw.WriteLine("  カスタムビュー DXF エクスポーター");
+                lw.WriteLine("========================================");
+                lw.WriteLine("パート名: " + partName);
 
                 // 2. 出力フォルダの選択
                 string outputFolder = SelectOutputFolder();
                 if (outputFolder == null)
                 {
-                    return; // キャンセル
+                    lw.WriteLine("フォルダ選択がキャンセルされました。");
+                    return;
                 }
+                lw.WriteLine("出力先:   " + outputFolder);
 
                 // 3. カスタムビューの取得
                 List<ModelingView> customViews = GetCustomViews();
                 if (customViews.Count == 0)
                 {
+                    lw.WriteLine("カスタムビューが見つかりません。");
                     theUI.NXMessageBox.Show("情報", NXMessageBox.DialogType.Information,
                         "カスタムビューが見つかりません。");
                     return;
                 }
 
-                // 4. カスタムビューごとのループ処理
-                foreach (ModelingView view in customViews)
+                lw.WriteLine("----------------------------------------");
+                lw.WriteLine("変換対象ビュー: " + customViews.Count + " 件");
+                for (int i = 0; i < customViews.Count; i++)
                 {
+                    lw.WriteLine(string.Format("  {0}. {1}", i + 1, customViews[i].Name));
+                }
+                lw.WriteLine("----------------------------------------");
+
+                // 4. カスタムビューごとのループ処理
+                for (int i = 0; i < customViews.Count; i++)
+                {
+                    ModelingView view = customViews[i];
+                    lw.WriteLine(string.Format("\n[{0}/{1}] 処理中: {2}", i + 1, customViews.Count, view.Name));
+
+                    Stopwatch viewSw = Stopwatch.StartNew();
                     try
                     {
                         ExportViewAsDxf(view, partName, outputFolder);
+                        viewSw.Stop();
                         successCount++;
+                        lw.WriteLine(string.Format("  → 成功 ({0:F1}秒)", viewSw.Elapsed.TotalSeconds));
                     }
                     catch (Exception ex)
                     {
+                        viewSw.Stop();
                         failCount++;
+                        lw.WriteLine(string.Format("  → 失敗 ({0:F1}秒): {1}", viewSw.Elapsed.TotalSeconds, ex.Message));
                         theSession.LogFile.WriteLine(
                             string.Format("ビュー '{0}' のエクスポートに失敗: {1}", view.Name, ex.Message));
                     }
@@ -106,6 +141,16 @@ namespace NXCustomViewDxfExporter
                 }
 
                 // 結果表示
+                totalSw.Stop();
+                lw.WriteLine("\n========================================");
+                lw.WriteLine("  処理結果");
+                lw.WriteLine("========================================");
+                lw.WriteLine(string.Format("成功: {0} 件", successCount));
+                if (failCount > 0)
+                    lw.WriteLine(string.Format("失敗: {0} 件", failCount));
+                lw.WriteLine(string.Format("合計処理時間: {0:F1}秒", totalSw.Elapsed.TotalSeconds));
+                lw.WriteLine("========================================");
+
                 string message = string.Format("DXFエクスポート完了: {0}ファイル出力しました", successCount);
                 if (failCount > 0)
                 {
@@ -115,6 +160,7 @@ namespace NXCustomViewDxfExporter
             }
             catch (Exception ex)
             {
+                lw.WriteLine("致命的エラー: " + ex.Message);
                 theUI.NXMessageBox.Show("エラー", NXMessageBox.DialogType.Error,
                     string.Format("予期しないエラーが発生しました:\n{0}", ex.Message));
             }
@@ -122,6 +168,15 @@ namespace NXCustomViewDxfExporter
             {
                 // UndoMarkまで戻す（図面シート等の変更を取り消す）
                 theSession.UndoToMark(undoMark, null);
+
+                // CGM環境変数を元に戻す
+                try
+                {
+                    Environment.SetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE", originalCgmEnv);
+                }
+                catch { }
+
+                // パートは絶対に保存しない（保存するとCGMダイアログの原因になる）
             }
         }
 
@@ -255,33 +310,67 @@ namespace NXCustomViewDxfExporter
             }
         }
 
+        /// <summary>
+        /// ビューとシートをUndoで巻き戻してクリーンアップ。
+        /// 明示的なシート削除（Draw.DeleteDrawing）はCGMダイアログの原因になるため、
+        /// UndoToMarkで巻き戻すことでダイアログの発生条件自体を回避する。
+        /// </summary>
         private static void CleanupViewAndSheet(NXObject baseViewObj, DrawingSheet sheet, Session.UndoMarkId undoMark)
         {
-            // ビューの削除
-            if (baseViewObj != null)
+            try
             {
-                try
+                // UndoToMarkでシート作成・ビュー配置を巻き戻す
+                // → 明示的な削除が不要になり、CGMダイアログを回避
+                theSession.UndoToMark(undoMark, null);
+            }
+            catch
+            {
+                // Undo失敗時はフォールバックとして明示的削除を試行
+                if (baseViewObj != null)
                 {
-                    theSession.UpdateManager.AddObjectsToDeleteList(new NXObject[] { baseViewObj });
-                    theSession.UpdateManager.DoUpdate(undoMark);
+                    try
+                    {
+                        theSession.UpdateManager.AddObjectsToDeleteList(new NXObject[] { baseViewObj });
+                        theSession.UpdateManager.DoUpdate(undoMark);
+                    }
+                    catch { }
                 }
-                catch
+
+                if (sheet != null)
                 {
-                    // ビュー削除失敗は無視
+                    try
+                    {
+                        theUFSession.Draw.DeleteDrawing(sheet.Tag);
+                    }
+                    catch { }
                 }
             }
+        }
 
-            // シートの削除
-            if (sheet != null)
+        /// <summary>
+        /// CGM保存ダイアログを抑制するための多層的な対策。
+        /// ダイアログ: 「表示されていないシートを含むパートは、それらと一緒にCGMを
+        /// 保存せず、既存のCGMは削除されます」
+        ///
+        /// 対策1: 環境変数 UGII_CGM_FITS_FILE_SAVE=0
+        /// 対策2: SaveOptions.DrawingCgmData=false
+        /// 対策3: 処理フローの工夫 — シートの明示的削除をせずUndoToMarkで巻き戻す
+        ///        （CleanupViewAndSheet内で実装）
+        /// 対策4: パートを保存しない（UndoMarkで元に戻すため保存不要）
+        /// </summary>
+        private static void SuppressCgmDialog()
+        {
+            // 対策1: 環境変数でCGM保存を無効化
+            Environment.SetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE", "0");
+
+            // 対策2: パートのSaveOptionsで図面CGMデータ保存を無効化
+            try
             {
-                try
-                {
-                    theUFSession.Draw.DeleteDrawing(sheet.Tag);
-                }
-                catch
-                {
-                    // シート削除失敗は無視
-                }
+                workPart.SaveOptions.DrawingCgmData = false;
+            }
+            catch
+            {
+                // NXバージョンによってはこのAPIが利用できない場合がある
             }
         }
 
