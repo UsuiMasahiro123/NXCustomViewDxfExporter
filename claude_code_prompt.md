@@ -149,7 +149,7 @@ UGI_LOAD_COMP = Load Components
 UGI_LOAD_OPTION = Load From Assem Dir
 UGI_LOAD_VER = Load Exact Version
 UGI_PROC_ASSEM = Overwrite load_options.def values
-UGI_SEARCH_DIRS =
+UGI_SEARCH_DIRS ={PART_DIR}
 UGI_SOLID_EXPORT = FACET
 UGI_SOLID_MASK = 
 UGI_SPLINE_EXPORT = SPLINE
@@ -162,16 +162,62 @@ VIEW_MODERASE_MODE = YES
 WIDTHFACTOR_CALCULATION_ON_EXPORT = AUTOMATIC_CALCULATION
 ```
 
+※ `{PART_DIR}` はプレースホルダ。コード内で実際のパートファイルのディレクトリパスに置換してからdefファイルを生成すること。
+
 ※ 元のdefファイルにあった以下のマッピングファイル参照行は**除外**する（外部ファイルに依存しないため）:
 - `CHARACTERFONT_MAPPING_FILENAME`
 - `CROSSHATCH_MAPPING_FILENAME`
 - `LINEFONT_MAPPING_FILENAME`
 
+### パートファイル参照エラーの対策（重要）
+DLL経由でDXFエクスポートすると、NXが一時ファイルからエクスポート処理を行う際に、元のパートファイルへの参照が解決できず以下のエラーが発生する:
+```
+Failed to retrieve file: 2P684813-1_A.prt, Reason : Failed to find file using current search options, part left unloaded
+```
+
+これにより寸法やラベルが欠落する（手動:17寸法→DLL:16寸法、手動:3ラベル→DLL:0ラベル）。
+
+**以下の全ての対策を実装すること:**
+
+1. **defファイルのUGI_SEARCH_DIRSにパートファイルのディレクトリを設定**
+   ```csharp
+   string partDir = Path.GetDirectoryName(workPart.FullPath);
+   string defContent = embeddedDefContent.Replace("{PART_DIR}", partDir);
+   ```
+
+2. **NXのロードオプションで検索ディレクトリを追加**
+   ```csharp
+   // エクスポート前にパートの検索パスを設定
+   theSession.Parts.LoadOptions.SetSearchDirectories(
+       new string[] { partDir });
+   ```
+
+3. **エクスポート前にパートを一時保存**
+   DXFエクスポーター内部で一時パートを作成する際に元パートを参照するため、パートが保存済みである必要がある:
+   ```csharp
+   // 処理開始前にパートが保存済み（ディスク上に存在）であることを確認
+   // パートが未保存（新規）の場合はユーザーに保存を促すメッセージを表示
+   if (string.IsNullOrEmpty(workPart.FullPath))
+   {
+       // エラー: パートファイルが保存されていません
+   }
+   ```
+
+4. **UF_ASSEM検索パスの設定**
+   ```csharp
+   // UFSessionで検索ディレクトリを追加設定
+   theUfSession.Assem.SetSearchDirectories(partDir);
+   ```
+
 ### 実装方法
 ```csharp
-// 1. 埋め込みdef内容から一時ファイルを生成
+// 0. パートファイルのディレクトリを取得
+string partDir = Path.GetDirectoryName(workPart.FullPath);
+
+// 1. 埋め込みdef内容のプレースホルダを置換し、一時ファイルを生成
+string defContent = embeddedDefContent.Replace("{PART_DIR}", partDir);
 string tempDefPath = Path.Combine(Path.GetTempPath(), "nxdxf_export_settings.def");
-File.WriteAllText(tempDefPath, embeddedDefContent);
+File.WriteAllText(tempDefPath, defContent);
 
 // 2. DxfdwgCreatorに読み込ませる（他の設定より前に行うこと）
 dxfdwgCreator.SettingsFile = tempDefPath;

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 using NXOpen;
 using NXOpen.Drawings;
@@ -30,6 +31,85 @@ namespace NXCustomViewDxfExporter
         private static UI theUI;
         private static Part workPart;
         private static ListingWindow lw;
+
+        // 一時defファイルのパス（処理全体で共有し、終了時に削除）
+        private static string tempDefPath;
+
+        // Tempにコピーしたパートファイルのパス（終了時に削除）
+        private static readonly List<string> tempPartCopies = new List<string>();
+
+        // 停止ボタン用フラグ
+        private static volatile bool cancelRequested;
+        private static Form cancelForm;
+
+        // dxfdwg.def 埋め込み内容（DLL経由エクスポート時の設定ズレを防止）
+        private static readonly string EmbeddedDefContent =
+            "ACAD_LAYOUTS_TO_IMPORT =\r\n" +
+            "ACAD_VERSION = 2018\r\n" +
+            "ALTERNATE_SYMBOL_FONT_FOR_EXPORT =Arial Unicode MS\r\n" +
+            "ASPECT_RATIO_CALCULATION_ON_IMPORT =AUTOMATIC_CALCULATION\r\n" +
+            "ASSEMBLY_MAP = ON\r\n" +
+            "AVOID_NX_TEMPLATE_PART_LAYERS =YES\r\n" +
+            "BASE_PART_IN =dwgnull_in.prt\r\n" +
+            "BASE_PART_METER =dwgnull_meter.prt\r\n" +
+            "BASE_PART_MICRON =dwgnull_micron.prt\r\n" +
+            "BASE_PART_MM =dwgnull_mm.prt\r\n" +
+            "BSPLINE_TO_PLINE_CONV_TOL =0.08\r\n" +
+            "CHOOSE_DIRECTION = UG TO DXF\r\n" +
+            "DATA_REDUCTION =no\r\n" +
+            "DSP_MASK =VOLUMINOUS\r\n" +
+            "EXPORT_CURVE_ATTRIBUTES =NO\r\n" +
+            "EXPORT_DIMENSIONS_AS =REAL\r\n" +
+            "EXPORT_DRAWING_USING_CGM =NO\r\n" +
+            "EXPORT_SCALE =1.0\r\n" +
+            "FILL_MODE =OFF\r\n" +
+            "HEAL_GEOMETRY_ON_IMPORT =YES\r\n" +
+            "IMPORT_ACAD_BLOCK_AS =GROUP\r\n" +
+            "IMPORT_ACAD_CURVES_ON_SKETCH =NO\r\n" +
+            "IMPORT_ACAD_LAYOUTS =YES\r\n" +
+            "IMPORT_ACAD_LAYOUTS_TO =IMPORTED_VIEW\r\n" +
+            "IMPORT_ACAD_MODEL_DATA =YES\r\n" +
+            "IMPORT_ACAD_MODEL_DATA_TO =MODELING\r\n" +
+            "IMPORT_ALL_ACAD_LAYOUTS =YES\r\n" +
+            "IMPORT_OBJECTS_FROM_FROZEN_LAYER =NO\r\n" +
+            "IMPORT_OBJECTS_FROM_INVISIBLE_LAYER =NO\r\n" +
+            "IMPORT_UNSELECTED_ACAD_LAYERS =NO\r\n" +
+            "IMPORT_UNSELECTED_ACAD_LAYERS_TO =256\r\n" +
+            "LOG_FILE =\r\n" +
+            "MAX_SPLINE_DEGREE =3\r\n" +
+            "MINIMUM_OBJECT_SIZE_TO_EXCLUDE_ON_IMPORT =0.0\r\n" +
+            "MSG_MASK =VOLUMINOUS\r\n" +
+            "NON_NUMERIC_LAYER_SORTING_CRITERIA =ALPHABETICAL\r\n" +
+            "OPTIMIZE_GEOMETRY =NO\r\n" +
+            "SET_NX_LAYER_NUMBER_FROM_PREFIX =NO\r\n" +
+            "SIMPLIFY_GEOMETRY =NO\r\n" +
+            "SKIP_UNREFERENCED_ACAD_LAYERS =YES\r\n" +
+            "SUPPORT_MTEXT_FORMATTING_ON_IMPORT =NO\r\n" +
+            "SURFU =8\r\n" +
+            "SURFV =8\r\n" +
+            "UGI_ANNOT_MASK =Dimensions,Notes,Labels,ID Symbols,Tolerances,Centerlines,Crosshatching,Draft Aid by Parts,Stand Alone Symbols,Symbol Fonts\r\n" +
+            "UGI_COMP_FAIL = Continue if Load Fails\r\n" +
+            "UGI_COMP_SUB = Do not Allow Substitution\r\n" +
+            "UGI_CURVE_MASK =Points,Lines,Arcs,Conics,B-Curves,Silhouette Curves,Solid Edges on Drawings\r\n" +
+            "UGI_DIM_IMPORT_FLAG =GROUP\r\n" +
+            "UGI_DRAWING_NAMES =\r\n" +
+            "UGI_GDT_EXPORT_AS_BLOCK =YES\r\n" +
+            "UGI_LAYER_MASK =1-256\r\n" +
+            "UGI_LOAD_COMP = Load Components\r\n" +
+            "UGI_LOAD_OPTION = Load From Search Dirs\r\n" +
+            "UGI_LOAD_VER = Load Exact Version\r\n" +
+            "UGI_PROC_ASSEM = Overwrite load_options.def values\r\n" +
+            "UGI_SEARCH_DIRS ={PART_DIR}\r\n" +
+            "UGI_SOLID_EXPORT = FACET\r\n" +
+            "UGI_SOLID_MASK = \r\n" +
+            "UGI_SPLINE_EXPORT = SPLINE\r\n" +
+            "UGI_STRUCT_MASK =Groups,Views,Drawings,Components,Reference Sets\r\n" +
+            "UGI_SURF_MASK = \r\n" +
+            "UGI_USER_DEFINED_VIEWS =\r\n" +
+            "UNITS =Metric\r\n" +
+            "UNSELECTED_ACAD_LAYER_LIST =\r\n" +
+            "VIEW_MODERASE_MODE = YES\r\n" +
+            "WIDTHFACTOR_CALCULATION_ON_EXPORT = AUTOMATIC_CALCULATION\r\n";
 
         // 標準ビュー名リスト（英語・日本語）
         private static readonly HashSet<string> StandardViewNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -83,17 +163,39 @@ namespace NXCustomViewDxfExporter
                     return;
                 }
 
+                // パートが保存済み（ディスク上に存在）であることを確認
+                if (string.IsNullOrEmpty(workPart.FullPath))
+                {
+                    theUI.NXMessageBox.Show("エラー", NXMessageBox.DialogType.Error,
+                        "パートファイルが保存されていません。\n先にパートを保存してから実行してください。");
+                    return;
+                }
+
                 // CGMダイアログ抑制（処理開始前に設定）
                 SuppressCgmDialog();
 
-                // パート名（拡張子なし）を取得
+                // パート名（拡張子なし）とディレクトリを取得
                 string partName = Path.GetFileNameWithoutExtension(workPart.FullPath);
+                string partDir = Path.GetDirectoryName(workPart.FullPath);
                 lw.WriteLine("========================================");
                 lw.WriteLine("  カスタムビュー DXF エクスポーター");
                 lw.WriteLine("========================================");
                 lw.WriteLine("パート名: " + partName);
+                lw.WriteLine("パートDir: " + partDir);
 
-                // 2. 出力フォルダの選択
+                // 2. パートファイル検索パスの設定（Failed to retrieve file 対策）
+                SetupPartSearchPaths(partDir);
+
+                // 3. dxfdwg.def 一時ファイルの生成（{PART_DIR}をパートディレクトリに置換）
+                string defContent = EmbeddedDefContent.Replace("{PART_DIR}", partDir);
+                tempDefPath = Path.Combine(Path.GetTempPath(), "nxdxf_export_settings.def");
+                File.WriteAllText(tempDefPath, defContent);
+                lw.WriteLine("DEF設定ファイル: " + tempDefPath);
+
+                // 4. パートファイルをTempディレクトリにコピー（トランスレータが確実に参照可能にする）
+                CopyPartFilesToTemp(workPart.FullPath);
+
+                // 5. 出力フォルダの選択
                 string outputFolder = SelectOutputFolder();
                 if (outputFolder == null)
                 {
@@ -102,7 +204,7 @@ namespace NXCustomViewDxfExporter
                 }
                 lw.WriteLine("出力先:   " + outputFolder);
 
-                // 3. カスタムビューの取得
+                // 6. カスタムビューの取得
                 List<ModelingView> customViews = GetCustomViews();
                 if (customViews.Count == 0)
                 {
@@ -120,28 +222,49 @@ namespace NXCustomViewDxfExporter
                 }
                 lw.WriteLine("----------------------------------------");
 
-                // 4. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
-                //    ループ内で毎回切り替えるとNXウィンドウがアクティブになるため
+                // 7. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
                 theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
 
-                // 5. バックグラウンド処理の開始
-                //    ユーザーの作業中ウィンドウを保存し、フォーカスロックで
-                //    NXが前面に来るのを防止する。
+                // 8. バックグラウンド処理の開始
                 IntPtr userWindow = GetForegroundWindow();
 
                 try
                 {
-                    LockSetForegroundWindow(LSFW_LOCK);
+                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
+                    lw.WriteLine("[バックグラウンド] 画面更新を抑制しました");
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    lw.WriteLine("[バックグラウンド] 画面更新抑制失敗（続行）: " + ex.Message);
+                }
 
                 try
                 {
-                    // 6. カスタムビューごとのループ処理
+                    LockSetForegroundWindow(LSFW_LOCK);
+                    lw.WriteLine("[バックグラウンド] フォーカスロックを設定しました");
+                }
+                catch { }
+
+                // 9. 停止ボタンを表示
+                ShowCancelForm(customViews.Count);
+
+                try
+                {
+                    // 10. カスタムビューごとのループ処理
                     for (int i = 0; i < customViews.Count; i++)
                     {
+                        // 停止ボタンが押されたかチェック
+                        if (cancelRequested)
+                        {
+                            lw.WriteLine("\n★ ユーザーにより処理が中止されました。");
+                            break;
+                        }
+
                         ModelingView view = customViews[i];
                         lw.WriteLine(string.Format("\n[{0}/{1}] 処理中: {2}", i + 1, customViews.Count, view.Name));
+
+                        // 停止フォームの進捗を更新
+                        UpdateCancelFormProgress(i + 1, customViews.Count, view.Name);
 
                         Stopwatch viewSw = Stopwatch.StartNew();
                         try
@@ -171,10 +294,25 @@ namespace NXCustomViewDxfExporter
                 }
                 finally
                 {
+                    // 停止フォームを閉じる
+                    CloseCancelForm();
+
+                    // 画面更新を復帰（エラー時も確実に復帰）
+                    try
+                    {
+                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                        lw.WriteLine("[バックグラウンド] 画面更新を復帰しました");
+                    }
+                    catch (Exception ex)
+                    {
+                        lw.WriteLine("[バックグラウンド] 画面更新復帰失敗: " + ex.Message);
+                    }
+
                     // フォーカスロック解除（エラー時も確実に解除）
                     try
                     {
                         LockSetForegroundWindow(LSFW_UNLOCK);
+                        lw.WriteLine("[バックグラウンド] フォーカスロックを解除しました");
                     }
                     catch { }
 
@@ -187,7 +325,7 @@ namespace NXCustomViewDxfExporter
                     catch { }
                 }
 
-                // 7. モデリングアプリケーションに戻る
+                // 11. モデリングアプリケーションに戻る
                 try
                 {
                     theSession.ApplicationSwitchImmediate("UG_APP_MODELING");
@@ -205,6 +343,8 @@ namespace NXCustomViewDxfExporter
                 lw.WriteLine(string.Format("成功: {0} 件", successCount));
                 if (failCount > 0)
                     lw.WriteLine(string.Format("失敗: {0} 件", failCount));
+                if (cancelRequested)
+                    lw.WriteLine("※ ユーザーにより中止");
                 lw.WriteLine(string.Format("合計処理時間: {0:F1}秒", totalSw.Elapsed.TotalSeconds));
                 lw.WriteLine("========================================");
 
@@ -212,6 +352,10 @@ namespace NXCustomViewDxfExporter
                 if (failCount > 0)
                 {
                     message += string.Format("\n失敗: {0}件", failCount);
+                }
+                if (cancelRequested)
+                {
+                    message += "\n（ユーザーにより中止）";
                 }
                 theUI.NXMessageBox.Show("完了", NXMessageBox.DialogType.Information, message);
             }
@@ -223,6 +367,9 @@ namespace NXCustomViewDxfExporter
             }
             finally
             {
+                // 停止フォームが残っていたら閉じる
+                CloseCancelForm();
+
                 // UndoMarkまで戻す（図面シート等の変更を取り消す）
                 theSession.UndoToMark(undoMark, null);
 
@@ -233,9 +380,217 @@ namespace NXCustomViewDxfExporter
                 }
                 catch { }
 
+                // 一時defファイルを削除
+                try
+                {
+                    if (tempDefPath != null && File.Exists(tempDefPath))
+                        File.Delete(tempDefPath);
+                }
+                catch { }
+
+                // Tempにコピーしたパートファイルを削除
+                CleanupTempPartCopies();
+
                 // パートは絶対に保存しない（保存するとCGMダイアログの原因になる）
             }
         }
+
+        // ================================================================
+        // パートファイル検索パスの設定
+        // ================================================================
+
+        private static void SetupPartSearchPaths(string partDir)
+        {
+            // 対策1: 既存の検索ディレクトリにパートDirを追加（上書きではなく追加）
+            try
+            {
+                string[] existingDirs;
+                bool[] existingFlags;
+                theSession.Parts.LoadOptions.GetSearchDirectories(out existingDirs, out existingFlags);
+
+                List<string> allDirs = new List<string>();
+                List<bool> allFlags = new List<bool>();
+
+                // パートDirを先頭に追加（優先度最高）
+                allDirs.Add(partDir);
+                allFlags.Add(true); // サブディレクトリも検索
+
+                // 既存のディレクトリを追加
+                if (existingDirs != null)
+                {
+                    for (int i = 0; i < existingDirs.Length; i++)
+                    {
+                        if (!string.Equals(existingDirs[i], partDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            allDirs.Add(existingDirs[i]);
+                            allFlags.Add(existingFlags[i]);
+                        }
+                    }
+                }
+
+                theSession.Parts.LoadOptions.SetSearchDirectories(
+                    allDirs.ToArray(), allFlags.ToArray());
+                lw.WriteLine("[検索パス] LoadOptions.SetSearchDirectories 設定済み (" + allDirs.Count + "件)");
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine("[検索パス] LoadOptions設定失敗（続行）: " + ex.Message);
+            }
+
+            // 対策2: UF_ASSEMレベルで検索ディレクトリを設定
+            try
+            {
+                theUFSession.Assem.SetSearchDirectories(
+                    1,
+                    new string[] { partDir },
+                    new bool[] { true });
+                lw.WriteLine("[検索パス] UF_ASSEM.SetSearchDirectories 設定済み");
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine("[検索パス] UF_ASSEM設定失敗（続行）: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// パートファイルとその関連ファイルをTempディレクトリにコピー。
+        /// DXFトランスレータは%TEMP%と%TEMP%\2\に一時パートを作成し、
+        /// 元パートをファイル名のみで参照する。defの検索パス設定が効かない場合の
+        /// フォールバックとして、参照先にパートファイルを直接配置する。
+        /// </summary>
+        private static void CopyPartFilesToTemp(string partFullPath)
+        {
+            string partFileName = Path.GetFileName(partFullPath);
+            string tempDir = Path.GetTempPath();
+
+            // %TEMP% にコピー
+            CopySinglePartToDir(partFullPath, tempDir, partFileName);
+
+            // %TEMP%\2\ にコピー（DXFトランスレータが使うサブディレクトリ）
+            string tempDir2 = Path.Combine(tempDir, "2");
+            if (Directory.Exists(tempDir2))
+            {
+                CopySinglePartToDir(partFullPath, tempDir2, partFileName);
+            }
+        }
+
+        private static void CopySinglePartToDir(string srcPath, string destDir, string fileName)
+        {
+            try
+            {
+                string destPath = Path.Combine(destDir, fileName);
+                File.Copy(srcPath, destPath, true);
+                tempPartCopies.Add(destPath);
+                lw.WriteLine("[検索パス] パートファイルをコピー: " + destPath);
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine("[検索パス] パートコピー失敗（続行）: " + destDir + " - " + ex.Message);
+            }
+        }
+
+        private static void CleanupTempPartCopies()
+        {
+            foreach (string path in tempPartCopies)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                }
+                catch { }
+            }
+            tempPartCopies.Clear();
+        }
+
+        // ================================================================
+        // 停止ボタン（別スレッドのモードレスフォーム）
+        // ================================================================
+
+        private static void ShowCancelForm(int totalViews)
+        {
+            cancelRequested = false;
+            cancelForm = null;
+
+            Thread uiThread = new Thread(() =>
+            {
+                Form form = new Form();
+                form.Text = "DXFエクスポート";
+                form.Width = 340;
+                form.Height = 130;
+                form.FormBorderStyle = FormBorderStyle.FixedToolWindow;
+                form.StartPosition = FormStartPosition.CenterScreen;
+                form.TopMost = true;
+
+                Label label = new Label();
+                label.Text = string.Format("0/{0} 処理中...", totalViews);
+                label.Dock = DockStyle.Top;
+                label.Height = 40;
+                label.Padding = new Padding(10, 10, 10, 0);
+                form.Controls.Add(label);
+
+                Button btn = new Button();
+                btn.Text = "処理を停止";
+                btn.Dock = DockStyle.Bottom;
+                btn.Height = 40;
+                btn.Click += (s, e) =>
+                {
+                    cancelRequested = true;
+                    btn.Enabled = false;
+                    btn.Text = "停止中...";
+                    label.Text = "現在のビュー処理完了後に停止します...";
+                };
+                form.Controls.Add(btn);
+
+                cancelForm = form;
+                Application.Run(form);
+            });
+            uiThread.SetApartmentState(ApartmentState.STA);
+            uiThread.IsBackground = true;
+            uiThread.Start();
+
+            // フォームが初期化されるまで少し待つ
+            Thread.Sleep(300);
+        }
+
+        private static void UpdateCancelFormProgress(int current, int total, string viewName)
+        {
+            try
+            {
+                Form form = cancelForm;
+                if (form != null && form.IsHandleCreated && !form.IsDisposed)
+                {
+                    form.Invoke(new Action(() =>
+                    {
+                        if (form.Controls.Count > 0)
+                        {
+                            // Labelはindex 0（最初に追加したコントロール）
+                            form.Controls[0].Text = string.Format(
+                                "[{0}/{1}] {2}", current, total, viewName);
+                        }
+                    }));
+                }
+            }
+            catch { }
+        }
+
+        private static void CloseCancelForm()
+        {
+            try
+            {
+                Form form = cancelForm;
+                if (form != null && form.IsHandleCreated && !form.IsDisposed)
+                {
+                    form.Invoke(new Action(() => form.Close()));
+                }
+                cancelForm = null;
+            }
+            catch { }
+        }
+
+        // ================================================================
+        // フォルダ選択
+        // ================================================================
 
         private static string SelectOutputFolder()
         {
@@ -252,6 +607,10 @@ namespace NXCustomViewDxfExporter
             return selectedPath;
         }
 
+        // ================================================================
+        // カスタムビューのフィルタリング
+        // ================================================================
+
         private static List<ModelingView> GetCustomViews()
         {
             List<ModelingView> customViews = new List<ModelingView>();
@@ -267,6 +626,10 @@ namespace NXCustomViewDxfExporter
 
             return customViews;
         }
+
+        // ================================================================
+        // 個別ビューのエクスポート処理
+        // ================================================================
 
         private static void ExportViewAsDxf(ModelingView view, string partName, string outputFolder)
         {
@@ -335,6 +698,13 @@ namespace NXCustomViewDxfExporter
                 string dxfFilePath = Path.Combine(outputFolder, dxfFileName);
 
                 DxfdwgCreator dxfCreator = theSession.DexManager.CreateDxfdwgCreator();
+
+                // ★ 最重要: 埋め込みdef設定を最初に読み込む（他のプロパティ設定より前）
+                dxfCreator.SettingsFile = tempDefPath;
+
+                // ★ 入力ファイルを明示的に指定（トランスレータがパートを見つけられるようにする）
+                dxfCreator.InputFile = workPart.FullPath;
+
                 dxfCreator.ExportFrom = DxfdwgCreator.ExportFromOption.DisplayPart;
                 dxfCreator.OutputFileType = DxfdwgCreator.OutputFileTypeOption.Dxf;
                 dxfCreator.ExportAs = DxfdwgCreator.ExportAsOption.TwoD;
@@ -377,20 +747,15 @@ namespace NXCustomViewDxfExporter
 
         /// <summary>
         /// ビューとシートをUndoで巻き戻してクリーンアップ。
-        /// 明示的なシート削除（Draw.DeleteDrawing）はCGMダイアログの原因になるため、
-        /// UndoToMarkで巻き戻すことでダイアログの発生条件自体を回避する。
         /// </summary>
         private static void CleanupViewAndSheet(NXObject baseViewObj, DrawingSheet sheet, Session.UndoMarkId undoMark)
         {
             try
             {
-                // UndoToMarkでシート作成・ビュー配置を巻き戻す
-                // → 明示的な削除が不要になり、CGMダイアログを回避
                 theSession.UndoToMark(undoMark, null);
             }
             catch
             {
-                // Undo失敗時はフォールバックとして明示的削除を試行
                 if (baseViewObj != null)
                 {
                     try
@@ -412,36 +777,27 @@ namespace NXCustomViewDxfExporter
             }
         }
 
-        /// <summary>
-        /// CGM保存ダイアログを抑制するための多層的な対策。
-        /// ダイアログ: 「表示されていないシートを含むパートは、それらと一緒にCGMを
-        /// 保存せず、既存のCGMは削除されます」
-        ///
-        /// 対策1: 環境変数 UGII_CGM_FITS_FILE_SAVE=0
-        /// 対策2: SaveOptions.DrawingCgmData=false
-        /// 対策3: 処理フローの工夫 — シートの明示的削除をせずUndoToMarkで巻き戻す
-        ///        （CleanupViewAndSheet内で実装）
-        /// 対策4: パートを保存しない（UndoMarkで元に戻すため保存不要）
-        /// </summary>
+        // ================================================================
+        // CGMダイアログ抑制
+        // ================================================================
+
         private static void SuppressCgmDialog()
         {
-            // 対策1: 環境変数でCGM保存を無効化
             Environment.SetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE", "0");
 
-            // 対策2: パートのSaveOptionsで図面CGMデータ保存を無効化
             try
             {
                 workPart.SaveOptions.DrawingCgmData = false;
             }
-            catch
-            {
-                // NXバージョンによってはこのAPIが利用できない場合がある
-            }
+            catch { }
         }
+
+        // ================================================================
+        // ビューサイズ・シートサイズ
+        // ================================================================
 
         private static void GetViewBounds(out double width, out double height)
         {
-            // パートのボディからバウンディングボックスを推定
             try
             {
                 double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
@@ -456,7 +812,6 @@ namespace NXCustomViewDxfExporter
                     theUFSession.Modl.AskBoundingBoxExact(body.Tag,
                         Tag.Null, minCorner, directions, distances);
 
-                    // min_corner + directions * distances でバウンディングボックスの頂点を計算
                     double bodyMaxX = minCorner[0] + distances[0];
                     double bodyMaxY = minCorner[1] + distances[1];
                     double bodyMaxZ = minCorner[2] + distances[2];
@@ -476,11 +831,10 @@ namespace NXCustomViewDxfExporter
                     double dy = maxY - minY;
                     double dz = maxZ - minZ;
 
-                    // 最大の2軸を幅・高さとする
                     double[] dims = new double[] { dx, dy, dz };
                     Array.Sort(dims);
-                    width = dims[2];   // 最大
-                    height = dims[1];  // 2番目
+                    width = dims[2];
+                    height = dims[1];
 
                     if (width <= 0) width = 200.0;
                     if (height <= 0) height = 200.0;
@@ -493,7 +847,6 @@ namespace NXCustomViewDxfExporter
             }
             catch
             {
-                // デフォルトサイズ
                 width = 200.0;
                 height = 200.0;
             }
@@ -509,7 +862,6 @@ namespace NXCustomViewDxfExporter
                 double w = size[0];
                 double h = size[1];
 
-                // 横向き・縦向きの両方を試す
                 if ((w >= requiredWidth && h >= requiredHeight) ||
                     (h >= requiredWidth && w >= requiredHeight))
                 {
@@ -527,7 +879,6 @@ namespace NXCustomViewDxfExporter
                 }
             }
 
-            // A0でも収まらない場合はA0を使用（スケール縮小で対応）
             sheetWidth = SheetSizes[SheetSizes.Length - 1][0];
             sheetHeight = SheetSizes[SheetSizes.Length - 1][1];
         }
