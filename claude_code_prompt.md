@@ -86,43 +86,111 @@ NXで開いているパートファイルに対して、カスタムビューご
 ## DXFエクスポート設定の詳細（NX Open API）
 NXのDXF/DWGエクスポートは `NXOpen.DxfdwgCreator` クラスを使用します。
 
-### 基本設定
-- `OutputFileType` = DXF
-- `ExportFrom` = ExportFromDisplayPart
-- `ProcessHoldFlag` = true
-- `FileSaveFlag` = false
-- `ExportAs` = ExportAs2d
-- `OutputTo` = OutputToLayout
-- **`AutoCADRevision` = AC2018（DXF/DWGリビジョン: 2018-2024）** ※古いリビジョンだと寸法や線種が正しく出力されないため必須
-- 出力ファイルパスを設定
+### 最重要: dxfdwg.def 設定の埋め込み
+手動でDXFエクスポートすると正しく出力されるが、DLLからエクスポートすると寸法線が破線になったり消えたりする問題がある。これはDLL経由ではdxfdwg.defの設定が適用されず、デフォルト設定が使われるためである。
 
-### 寸法の出力設定（重要）
-DXF変換時に寸法が欠落・破線化する問題を防ぐため、以下を必ず設定すること:
-- **寸法はAutoCAD寸法オブジェクトとしてエクスポートする**（分解しない）
-  - `ExportDimensionsAs` = AutoCAD寸法オブジェクト（DXF側で編集可能にするため）
-- NX寸法スタイルをAutoCAD寸法スタイルに正しくマッピングすること
+**解決策: dxfdwg.def の内容をコード内に埋め込み、実行時に一時ファイルとして生成してDxfdwgCreatorに読み込ませる。**
 
-### 線スタイルの設定（重要）
-NXの線種とAutoCADの線種が正しくマッピングされないと、実線が破線になる問題が発生する:
-- NX線フォントをAutoCAD線種に正しくマッピングすること
-- 特にNXの実線（Solid）がAutoCADのContinuousに対応していることを確認
-- `LineFontMappingFile` は使用しない（デフォルトマッピングを使用）
+以下の内容をコード内に文字列定数として埋め込み、処理開始時にTempフォルダにdxfdwg.defを生成すること:
 
-### フォントの設定
-- NXフォントをAutoCADフォントにマッピング
-- 日本語テキストが含まれる場合、対応するAutoCADフォント（bigfont等）を指定
+```
+ACAD_LAYOUTS_TO_IMPORT =
+ACAD_VERSION = 2018
+ALTERNATE_SYMBOL_FONT_FOR_EXPORT =Arial Unicode MS
+ASPECT_RATIO_CALCULATION_ON_IMPORT =AUTOMATIC_CALCULATION
+ASSEMBLY_MAP = ON
+AVOID_NX_TEMPLATE_PART_LAYERS =YES
+BASE_PART_IN =dwgnull_in.prt
+BASE_PART_METER =dwgnull_meter.prt
+BASE_PART_MICRON =dwgnull_micron.prt
+BASE_PART_MM =dwgnull_mm.prt
+BSPLINE_TO_PLINE_CONV_TOL =0.08
+CHOOSE_DIRECTION = UG TO DXF
+DATA_REDUCTION =no
+DSP_MASK =VOLUMINOUS
+EXPORT_CURVE_ATTRIBUTES =NO
+EXPORT_DIMENSIONS_AS =REAL
+EXPORT_DRAWING_USING_CGM =NO
+EXPORT_SCALE =1.0
+FILL_MODE =OFF
+HEAL_GEOMETRY_ON_IMPORT =YES
+IMPORT_ACAD_BLOCK_AS =GROUP
+IMPORT_ACAD_CURVES_ON_SKETCH =NO
+IMPORT_ACAD_LAYOUTS =YES
+IMPORT_ACAD_LAYOUTS_TO =IMPORTED_VIEW
+IMPORT_ACAD_MODEL_DATA =YES
+IMPORT_ACAD_MODEL_DATA_TO =MODELING
+IMPORT_ALL_ACAD_LAYOUTS =YES
+IMPORT_OBJECTS_FROM_FROZEN_LAYER =NO
+IMPORT_OBJECTS_FROM_INVISIBLE_LAYER =NO
+IMPORT_UNSELECTED_ACAD_LAYERS =NO
+IMPORT_UNSELECTED_ACAD_LAYERS_TO =256
+LOG_FILE =
+MAX_SPLINE_DEGREE =3
+MINIMUM_OBJECT_SIZE_TO_EXCLUDE_ON_IMPORT =0.0
+MSG_MASK =VOLUMINOUS
+NON_NUMERIC_LAYER_SORTING_CRITERIA =ALPHABETICAL
+OPTIMIZE_GEOMETRY =NO
+SET_NX_LAYER_NUMBER_FROM_PREFIX =NO
+SIMPLIFY_GEOMETRY =NO
+SKIP_UNREFERENCED_ACAD_LAYERS =YES
+SUPPORT_MTEXT_FORMATTING_ON_IMPORT =NO
+SURFU =8
+SURFV =8
+UGI_ANNOT_MASK =Dimensions,Notes,Labels,ID Symbols,Tolerances,Centerlines,Crosshatching,Draft Aid by Parts,Stand Alone Symbols,Symbol Fonts
+UGI_COMP_FAIL = Continue if Load Fails
+UGI_COMP_SUB = Do not Allow Substitution
+UGI_CURVE_MASK =Points,Lines,Arcs,Conics,B-Curves,Silhouette Curves,Solid Edges on Drawings
+UGI_DIM_IMPORT_FLAG =GROUP
+UGI_DRAWING_NAMES =
+UGI_GDT_EXPORT_AS_BLOCK =YES
+UGI_LAYER_MASK =1-256
+UGI_LOAD_COMP = Load Components
+UGI_LOAD_OPTION = Load From Assem Dir
+UGI_LOAD_VER = Load Exact Version
+UGI_PROC_ASSEM = Overwrite load_options.def values
+UGI_SEARCH_DIRS =
+UGI_SOLID_EXPORT = FACET
+UGI_SOLID_MASK = 
+UGI_SPLINE_EXPORT = SPLINE
+UGI_STRUCT_MASK =Groups,Views,Drawings,Components,Reference Sets
+UGI_SURF_MASK = 
+UGI_USER_DEFINED_VIEWS =
+UNITS =Metric
+UNSELECTED_ACAD_LAYER_LIST =
+VIEW_MODERASE_MODE = YES
+WIDTHFACTOR_CALCULATION_ON_EXPORT = AUTOMATIC_CALCULATION
+```
 
-### レイヤー設定
-- 全レイヤー（1-256）をエクスポート対象にすること
-- 寸法レイヤーが除外されないよう注意
+※ 元のdefファイルにあった以下のマッピングファイル参照行は**除外**する（外部ファイルに依存しないため）:
+- `CHARACTERFONT_MAPPING_FILENAME`
+- `CROSSHATCH_MAPPING_FILENAME`
+- `LINEFONT_MAPPING_FILENAME`
 
-### ビューのフラット化
-- ビューをフラット化（Flatten Views）してエクスポートする
-- これにより、ビューポート内のジオメトリが直接レイアウト空間に展開される
+### 実装方法
+```csharp
+// 1. 埋め込みdef内容から一時ファイルを生成
+string tempDefPath = Path.Combine(Path.GetTempPath(), "nxdxf_export_settings.def");
+File.WriteAllText(tempDefPath, embeddedDefContent);
 
-### エクスポートデータの選択
-- エクスポート: 選択された図面（現在のシート）
-- 全てのオブジェクトタイプを含める（寸法、注記、ジオメトリ等）
+// 2. DxfdwgCreatorに読み込ませる（他の設定より前に行うこと）
+dxfdwgCreator.SettingsFile = tempDefPath;
+
+// 3. その後、出力固有の設定のみ上書き
+dxfdwgCreator.OutputFileType = ...  // DXF
+dxfdwgCreator.ExportFrom = ...      // DisplayPart
+dxfdwgCreator.ExportAs = ...        // 2D
+dxfdwgCreator.OutputTo = ...        // Layout
+// 出力ファイルパス設定
+
+// 4. 処理完了後に一時ファイルを削除
+try { File.Delete(tempDefPath); } catch { }
+```
+
+### 注意事項
+- **SettingsFileの設定は、他のプロパティ設定より前に行うこと**
+- 一時ファイルの生成・削除はtry-finallyで保護すること
+- マッピングファイル（フォント、線種、クロスハッチ）は外部参照せず、NXのデフォルトマッピングを使用する
 
 ## エントリポイント
 ```csharp

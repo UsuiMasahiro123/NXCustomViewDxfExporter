@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using NXOpen;
 using NXOpen.Drawings;
@@ -11,6 +12,19 @@ namespace NXCustomViewDxfExporter
 {
     public class CustomViewDxfExporter
     {
+        // Win32 API: フォーカス奪取を制御
+        [DllImport("user32.dll")]
+        private static extern bool LockSetForegroundWindow(uint uLockCode);
+        private const uint LSFW_LOCK = 1;
+        private const uint LSFW_UNLOCK = 2;
+
+        // Win32 API: フォーカスの保存・復元
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
         private static Session theSession;
         private static UFSession theUFSession;
         private static UI theUI;
@@ -106,31 +120,74 @@ namespace NXCustomViewDxfExporter
                 }
                 lw.WriteLine("----------------------------------------");
 
-                // 4. カスタムビューごとのループ処理
-                for (int i = 0; i < customViews.Count; i++)
-                {
-                    ModelingView view = customViews[i];
-                    lw.WriteLine(string.Format("\n[{0}/{1}] 処理中: {2}", i + 1, customViews.Count, view.Name));
+                // 4. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
+                //    ループ内で毎回切り替えるとNXウィンドウがアクティブになるため
+                theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
 
-                    Stopwatch viewSw = Stopwatch.StartNew();
-                    try
+                // 5. バックグラウンド処理の開始
+                //    ユーザーの作業中ウィンドウを保存し、フォーカスロックで
+                //    NXが前面に来るのを防止する。
+                IntPtr userWindow = GetForegroundWindow();
+
+                try
+                {
+                    LockSetForegroundWindow(LSFW_LOCK);
+                }
+                catch { }
+
+                try
+                {
+                    // 6. カスタムビューごとのループ処理
+                    for (int i = 0; i < customViews.Count; i++)
                     {
-                        ExportViewAsDxf(view, partName, outputFolder);
-                        viewSw.Stop();
-                        successCount++;
-                        lw.WriteLine(string.Format("  → 成功 ({0:F1}秒)", viewSw.Elapsed.TotalSeconds));
-                    }
-                    catch (Exception ex)
-                    {
-                        viewSw.Stop();
-                        failCount++;
-                        lw.WriteLine(string.Format("  → 失敗 ({0:F1}秒): {1}", viewSw.Elapsed.TotalSeconds, ex.Message));
-                        theSession.LogFile.WriteLine(
-                            string.Format("ビュー '{0}' のエクスポートに失敗: {1}", view.Name, ex.Message));
+                        ModelingView view = customViews[i];
+                        lw.WriteLine(string.Format("\n[{0}/{1}] 処理中: {2}", i + 1, customViews.Count, view.Name));
+
+                        Stopwatch viewSw = Stopwatch.StartNew();
+                        try
+                        {
+                            ExportViewAsDxf(view, partName, outputFolder);
+                            viewSw.Stop();
+                            successCount++;
+                            lw.WriteLine(string.Format("  → 成功 ({0:F1}秒)", viewSw.Elapsed.TotalSeconds));
+                        }
+                        catch (Exception ex)
+                        {
+                            viewSw.Stop();
+                            failCount++;
+                            lw.WriteLine(string.Format("  → 失敗 ({0:F1}秒): {1}", viewSw.Elapsed.TotalSeconds, ex.Message));
+                            theSession.LogFile.WriteLine(
+                                string.Format("ビュー '{0}' のエクスポートに失敗: {1}", view.Name, ex.Message));
+                        }
+
+                        // 各ビュー処理後にユーザーのウィンドウを前面に復帰
+                        try
+                        {
+                            if (userWindow != IntPtr.Zero)
+                                SetForegroundWindow(userWindow);
+                        }
+                        catch { }
                     }
                 }
+                finally
+                {
+                    // フォーカスロック解除（エラー時も確実に解除）
+                    try
+                    {
+                        LockSetForegroundWindow(LSFW_UNLOCK);
+                    }
+                    catch { }
 
-                // 5. モデリングアプリケーションに戻る
+                    // ユーザーのウィンドウを前面に復帰
+                    try
+                    {
+                        if (userWindow != IntPtr.Zero)
+                            SetForegroundWindow(userWindow);
+                    }
+                    catch { }
+                }
+
+                // 7. モデリングアプリケーションに戻る
                 try
                 {
                     theSession.ApplicationSwitchImmediate("UG_APP_MODELING");
@@ -219,9 +276,6 @@ namespace NXCustomViewDxfExporter
 
             try
             {
-                // a. 製図アプリケーションに切り替え
-                theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
-
                 // ビューのバウンディングボックスからシートサイズを決定
                 double viewWidth;
                 double viewHeight;
@@ -289,6 +343,17 @@ namespace NXCustomViewDxfExporter
                 dxfCreator.OutputTo = DxfdwgCreator.OutputToOption.Drafting;
                 dxfCreator.ExportData = DxfdwgCreator.ExportDataOption.Drawing;
                 dxfCreator.OutputFile = dxfFilePath;
+
+                // DXF/DWGリビジョン: 2018-2024（寸法・線種の正確な出力に必須）
+                dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2018;
+
+                // 寸法・注記を含める（寸法線の欠落防止）
+                dxfCreator.ObjectTypes.Annotations = true;
+                dxfCreator.ObjectTypes.Curves = true;
+                dxfCreator.ObjectTypes.Solids = true;
+
+                // 全レイヤーをエクスポート対象にする（寸法レイヤーの除外を防止）
+                dxfCreator.LayerMask = "1-256";
 
                 // 図面シートを選択
                 dxfCreator.ExportSelectionBlock.SelectionScope = ObjectSelector.Scope.SelectedObjects;
