@@ -1,9 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Windows.Forms;
 using NXOpen;
 using NXOpen.Drawings;
@@ -13,26 +13,16 @@ namespace NXCustomViewDxfExporter
 {
     public class CustomViewDxfExporter
     {
-        // Win32 API: フォーカス制御
+        // Win32 API: フォーカス制御・ウィンドウ制御
         [DllImport("user32.dll")]
         private static extern bool LockSetForegroundWindow(uint uLockCode);
         private const uint LSFW_LOCK = 1;
         private const uint LSFW_UNLOCK = 2;
 
         [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-        [DllImport("user32.dll")]
-        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-
-        [DllImport("kernel32.dll")]
-        private static extern uint GetCurrentThreadId();
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private const int SW_MINIMIZE = 6;
+        private const int SW_RESTORE = 9;
 
         private static Session theSession;
         private static UFSession theUFSession;
@@ -46,13 +36,13 @@ namespace NXCustomViewDxfExporter
         // Tempにコピーしたパートファイルのパス（終了時に削除）
         private static readonly List<string> tempPartCopies = new List<string>();
 
-        // 停止ボタン用フラグ
-        private static volatile bool cancelRequested;
-        private static Form cancelForm;
-
-        // フォーカス制御用
+        // NXメインウィンドウハンドル
         private static IntPtr nxMainWindow = IntPtr.Zero;
-        private static volatile IntPtr lastNonNxForeground = IntPtr.Zero;
+
+        // 言語設定
+        private static bool isJapanese;
+        private static Dictionary<string, string> messagesJa;
+        private static Dictionary<string, string> messagesEn;
 
         // dxfdwg.def 埋め込み内容（DLL経由エクスポート時の設定ズレを防止）
         private static readonly string EmbeddedDefContent =
@@ -146,6 +136,160 @@ namespace NXCustomViewDxfExporter
 
         private const double SheetMargin = 10.0; // 各辺のマージン(mm)
 
+        // ================================================================
+        // 言語初期化・メッセージ取得
+        // ================================================================
+
+        private static void InitializeLanguage()
+        {
+            string lang = Environment.GetEnvironmentVariable("UGII_LANG");
+            if (!string.IsNullOrEmpty(lang))
+            {
+                isJapanese = lang.Equals("japanese", StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                isJapanese = System.Globalization.CultureInfo.CurrentUICulture.Name.StartsWith("ja");
+            }
+
+            messagesJa = new Dictionary<string, string>
+            {
+                // ダイアログタイトル
+                { "Error", "エラー" },
+                { "Info", "情報" },
+                // エラーメッセージ
+                { "ErrorNoPartOpen", "パートファイルが開かれていません。" },
+                { "ErrorPartNotSaved", "パートファイルが保存されていません。\n先にパートを保存してから実行してください。" },
+                { "ErrorNoCustomView", "カスタムビューが見つかりません。" },
+                // リスティングウィンドウ
+                { "HeaderTitle", "カスタムビュー DXF エクスポーター" },
+                { "LwPartName", "パート名: {0}" },
+                { "LwPartDir", "パートDir: {0}" },
+                { "LwDefFile", "DEF設定ファイル: {0}" },
+                { "LwSearchPathSet", "[検索パス] LoadOptions.SetSearchDirectories 設定済み ({0}件)" },
+                { "LwSearchPathFailed", "[検索パス] LoadOptions設定失敗（続行）: {0}" },
+                { "LwSearchPathAssemSet", "[検索パス] UF_ASSEM.SetSearchDirectories 設定済み" },
+                { "LwSearchPathAssemFailed", "[検索パス] UF_ASSEM設定失敗（続行）: {0}" },
+                { "LwPartCopied", "[検索パス] パートファイルをコピー: {0}" },
+                { "LwPartCopyFailed", "[検索パス] パートコピー失敗（続行）: {0} - {1}" },
+                { "FolderSelectTitle", "DXF出力先フォルダを選択" },
+                { "FolderCancelled", "フォルダ選択がキャンセルされました。" },
+                { "LwOutput", "出力先: {0}" },
+                { "LwTargetViews", "変換対象ビュー: {0} 件" },
+                { "LwDisplaySuppressed", "[バックグラウンド] 画面更新を抑制しました" },
+                { "LwDisplaySuppressFailed", "[バックグラウンド] 画面更新抑制失敗（続行）: {0}" },
+                { "UserStopped", "★ ユーザーにより処理が中止されました。" },
+                { "LwProcessing", "[{0}/{1}] 処理中: {2}" },
+                { "LwSuccess", "  → 成功 ({0:F1}秒)" },
+                { "LwFailed", "  → 失敗 ({0:F1}秒): {1}" },
+                { "LwViewExportFailed", "ビュー '{0}' のエクスポートに失敗: {1}" },
+                { "LwDisplayRestored", "[バックグラウンド] 画面更新を復帰しました" },
+                { "LwDisplayRestoreFailed", "[バックグラウンド] 画面更新復帰失敗: {0}" },
+                { "ResultTitle", "処理結果" },
+                { "LwTotalTime", "合計処理時間: {0:F1}秒" },
+                { "FatalError", "致命的エラー: {0}" },
+                { "UnexpectedError", "予期しないエラーが発生しました:\n{0}" },
+                // 進捗ダイアログ
+                { "ProgressTitle", "DXFエクスポート中..." },
+                { "ProgressMessage", "処理中: {0}（{1}/{2}）" },
+                { "StopButton", "停止" },
+                { "StopRequesting", "停止中..." },
+                // 完了ダイアログ
+                { "CompleteTitleSuccess", "DXFエクスポート完了" },
+                { "CompleteTitleError", "DXFエクスポート完了（一部エラー）" },
+                { "CompleteMessage", "DXFエクスポートが完了しました" },
+                { "CompleteMessageError", "DXFエクスポートが完了しました（一部エラー）" },
+                { "SuccessCount", "成功: {0} ファイル" },
+                { "FailureCount", "失敗: {0} ファイル" },
+                { "CancelCount", "中断: {0} ファイル（ユーザー停止）" },
+                { "OutputPath", "出力先: {0}" },
+                { "ErrorDetails", "エラー詳細:" },
+                { "OkButton", "OK" },
+            };
+
+            messagesEn = new Dictionary<string, string>
+            {
+                // Dialog titles
+                { "Error", "Error" },
+                { "Info", "Information" },
+                // Error messages
+                { "ErrorNoPartOpen", "No part file is open." },
+                { "ErrorPartNotSaved", "Part file is not saved.\nPlease save the part before running." },
+                { "ErrorNoCustomView", "No custom views found." },
+                // Listing window
+                { "HeaderTitle", "Custom View DXF Exporter" },
+                { "LwPartName", "Part: {0}" },
+                { "LwPartDir", "Part Dir: {0}" },
+                { "LwDefFile", "DEF Settings: {0}" },
+                { "LwSearchPathSet", "[Search Path] LoadOptions.SetSearchDirectories configured ({0} entries)" },
+                { "LwSearchPathFailed", "[Search Path] LoadOptions configuration failed (continuing): {0}" },
+                { "LwSearchPathAssemSet", "[Search Path] UF_ASSEM.SetSearchDirectories configured" },
+                { "LwSearchPathAssemFailed", "[Search Path] UF_ASSEM configuration failed (continuing): {0}" },
+                { "LwPartCopied", "[Search Path] Part file copied: {0}" },
+                { "LwPartCopyFailed", "[Search Path] Part copy failed (continuing): {0} - {1}" },
+                { "FolderSelectTitle", "Select DXF Output Folder" },
+                { "FolderCancelled", "Folder selection cancelled." },
+                { "LwOutput", "Output: {0}" },
+                { "LwTargetViews", "Target views: {0}" },
+                { "LwDisplaySuppressed", "[Background] Display updates suppressed" },
+                { "LwDisplaySuppressFailed", "[Background] Display suppression failed (continuing): {0}" },
+                { "UserStopped", "* Processing stopped by user." },
+                { "LwProcessing", "[{0}/{1}] Processing: {2}" },
+                { "LwSuccess", "  -> Success ({0:F1}s)" },
+                { "LwFailed", "  -> Failed ({0:F1}s): {1}" },
+                { "LwViewExportFailed", "View '{0}' export failed: {1}" },
+                { "LwDisplayRestored", "[Background] Display updates restored" },
+                { "LwDisplayRestoreFailed", "[Background] Display restoration failed: {0}" },
+                { "ResultTitle", "Results" },
+                { "LwTotalTime", "Total time: {0:F1}s" },
+                { "FatalError", "Fatal error: {0}" },
+                { "UnexpectedError", "An unexpected error occurred:\n{0}" },
+                // Progress dialog
+                { "ProgressTitle", "Exporting DXF..." },
+                { "ProgressMessage", "Processing: {0} ({1}/{2})" },
+                { "StopButton", "Stop" },
+                { "StopRequesting", "Stopping..." },
+                // Completion dialog
+                { "CompleteTitleSuccess", "DXF Export Complete" },
+                { "CompleteTitleError", "DXF Export Complete (with errors)" },
+                { "CompleteMessage", "DXF export completed successfully" },
+                { "CompleteMessageError", "DXF export completed with some errors" },
+                { "SuccessCount", "Success: {0} files" },
+                { "FailureCount", "Failed: {0} files" },
+                { "CancelCount", "Cancelled: {0} files (user stopped)" },
+                { "OutputPath", "Output: {0}" },
+                { "ErrorDetails", "Error details:" },
+                { "OkButton", "OK" },
+            };
+        }
+
+        private static string GetMessage(string key)
+        {
+            var dict = isJapanese ? messagesJa : messagesEn;
+            return dict.ContainsKey(key) ? dict[key] : key;
+        }
+
+        private static string GetMessage(string key, params object[] args)
+        {
+            return string.Format(GetMessage(key), args);
+        }
+
+        private static Font GetUIFont(float size, FontStyle style = FontStyle.Regular)
+        {
+            try
+            {
+                Font font = new Font("Yu Gothic UI", size, style);
+                if (font.Name == "Yu Gothic UI") return font;
+                font.Dispose();
+            }
+            catch { }
+            return new Font("Segoe UI", size, style);
+        }
+
+        // ================================================================
+        // メインエントリポイント
+        // ================================================================
+
         public static void Main(string[] args)
         {
             theSession = Session.GetSession();
@@ -153,6 +297,8 @@ namespace NXCustomViewDxfExporter
             theUI = UI.GetUI();
             lw = theSession.ListingWindow;
             lw.Open();
+
+            InitializeLanguage();
 
             Stopwatch totalSw = Stopwatch.StartNew();
 
@@ -163,6 +309,12 @@ namespace NXCustomViewDxfExporter
 
             int successCount = 0;
             int failCount = 0;
+            int cancelCount = 0;
+            List<string> errorDetails = new List<string>();
+            string outputFolder = null;
+
+            nxMainWindow = Process.GetCurrentProcess().MainWindowHandle;
+            ProgressForm progressForm = null;
 
             try
             {
@@ -170,16 +322,16 @@ namespace NXCustomViewDxfExporter
                 workPart = theSession.Parts.Work;
                 if (workPart == null)
                 {
-                    theUI.NXMessageBox.Show("エラー", NXMessageBox.DialogType.Error,
-                        "パートファイルが開かれていません。");
+                    theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
+                        GetMessage("ErrorNoPartOpen"));
                     return;
                 }
 
                 // パートが保存済み（ディスク上に存在）であることを確認
                 if (string.IsNullOrEmpty(workPart.FullPath))
                 {
-                    theUI.NXMessageBox.Show("エラー", NXMessageBox.DialogType.Error,
-                        "パートファイルが保存されていません。\n先にパートを保存してから実行してください。");
+                    theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
+                        GetMessage("ErrorPartNotSaved"));
                     return;
                 }
 
@@ -190,10 +342,10 @@ namespace NXCustomViewDxfExporter
                 string partName = Path.GetFileNameWithoutExtension(workPart.FullPath);
                 string partDir = Path.GetDirectoryName(workPart.FullPath);
                 lw.WriteLine("========================================");
-                lw.WriteLine("  カスタムビュー DXF エクスポーター");
+                lw.WriteLine("  " + GetMessage("HeaderTitle"));
                 lw.WriteLine("========================================");
-                lw.WriteLine("パート名: " + partName);
-                lw.WriteLine("パートDir: " + partDir);
+                lw.WriteLine(GetMessage("LwPartName", partName));
+                lw.WriteLine(GetMessage("LwPartDir", partDir));
 
                 // 2. パートファイル検索パスの設定（Failed to retrieve file 対策）
                 SetupPartSearchPaths(partDir);
@@ -202,32 +354,32 @@ namespace NXCustomViewDxfExporter
                 string defContent = EmbeddedDefContent.Replace("{PART_DIR}", partDir);
                 tempDefPath = Path.Combine(Path.GetTempPath(), "nxdxf_export_settings.def");
                 File.WriteAllText(tempDefPath, defContent);
-                lw.WriteLine("DEF設定ファイル: " + tempDefPath);
+                lw.WriteLine(GetMessage("LwDefFile", tempDefPath));
 
                 // 4. パートファイルをTempディレクトリにコピー（トランスレータが確実に参照可能にする）
                 CopyPartFilesToTemp(workPart.FullPath);
 
-                // 5. 出力フォルダの選択
-                string outputFolder = SelectOutputFolder();
+                // 5. 出力フォルダの選択（NX最小化の前に実行）
+                outputFolder = SelectOutputFolder();
                 if (outputFolder == null)
                 {
-                    lw.WriteLine("フォルダ選択がキャンセルされました。");
+                    lw.WriteLine(GetMessage("FolderCancelled"));
                     return;
                 }
-                lw.WriteLine("出力先:   " + outputFolder);
+                lw.WriteLine(GetMessage("LwOutput", outputFolder));
 
                 // 6. カスタムビューの取得
                 List<ModelingView> customViews = GetCustomViews();
                 if (customViews.Count == 0)
                 {
-                    lw.WriteLine("カスタムビューが見つかりません。");
-                    theUI.NXMessageBox.Show("情報", NXMessageBox.DialogType.Information,
-                        "カスタムビューが見つかりません。");
+                    lw.WriteLine(GetMessage("ErrorNoCustomView"));
+                    theUI.NXMessageBox.Show(GetMessage("Info"), NXMessageBox.DialogType.Information,
+                        GetMessage("ErrorNoCustomView"));
                     return;
                 }
 
                 lw.WriteLine("----------------------------------------");
-                lw.WriteLine("変換対象ビュー: " + customViews.Count + " 件");
+                lw.WriteLine(GetMessage("LwTargetViews", customViews.Count));
                 for (int i = 0; i < customViews.Count; i++)
                 {
                     lw.WriteLine(string.Format("  {0}. {1}", i + 1, customViews[i].Name));
@@ -237,97 +389,89 @@ namespace NXCustomViewDxfExporter
                 // 7. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
                 theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
 
-                // 8. バックグラウンド処理の開始
-                // NXメインウィンドウのハンドルを取得（フォーカス監視用）
-                nxMainWindow = System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle;
-                lastNonNxForeground = IntPtr.Zero;
+                // 8. NXウィンドウを最小化
+                ShowWindow(nxMainWindow, SW_MINIMIZE);
 
-                try
-                {
-                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
-                    lw.WriteLine("[バックグラウンド] 画面更新を抑制しました");
-                }
-                catch (Exception ex)
-                {
-                    lw.WriteLine("[バックグラウンド] 画面更新抑制失敗（続行）: " + ex.Message);
-                }
-
+                // 9. フォーカスロック
                 try
                 {
                     LockSetForegroundWindow(LSFW_LOCK);
                 }
                 catch { }
 
-                // 9. 停止ボタンを表示
-                ShowCancelForm(customViews.Count);
-
+                // 10. 画面更新を抑制
                 try
                 {
-                    // 10. カスタムビューごとのループ処理
-                    for (int i = 0; i < customViews.Count; i++)
-                    {
-                        // 停止ボタンが押されたかチェック
-                        if (cancelRequested)
-                        {
-                            lw.WriteLine("\n★ ユーザーにより処理が中止されました。");
-                            break;
-                        }
-
-                        ModelingView view = customViews[i];
-                        lw.WriteLine(string.Format("\n[{0}/{1}] 処理中: {2}", i + 1, customViews.Count, view.Name));
-
-                        // 停止フォームの進捗を更新
-                        UpdateCancelFormProgress(i + 1, customViews.Count, view.Name);
-
-                        Stopwatch viewSw = Stopwatch.StartNew();
-                        try
-                        {
-                            ExportViewAsDxf(view, partName, outputFolder);
-                            viewSw.Stop();
-                            successCount++;
-                            lw.WriteLine(string.Format("  → 成功 ({0:F1}秒)", viewSw.Elapsed.TotalSeconds));
-                        }
-                        catch (Exception ex)
-                        {
-                            viewSw.Stop();
-                            failCount++;
-                            lw.WriteLine(string.Format("  → 失敗 ({0:F1}秒): {1}", viewSw.Elapsed.TotalSeconds, ex.Message));
-                            theSession.LogFile.WriteLine(
-                                string.Format("ビュー '{0}' のエクスポートに失敗: {1}", view.Name, ex.Message));
-                        }
-
-                        // 各ビュー処理後にフォーカスを復帰
-                        RestoreFocus();
-                    }
+                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
+                    lw.WriteLine(GetMessage("LwDisplaySuppressed"));
                 }
-                finally
+                catch (Exception ex)
                 {
-                    // 停止フォームを閉じる
-                    CloseCancelForm();
+                    lw.WriteLine(GetMessage("LwDisplaySuppressFailed", ex.Message));
+                }
 
-                    // 画面更新を復帰（エラー時も確実に復帰）
+                // 11. 進捗ダイアログを表示（メインスレッド）
+                progressForm = new ProgressForm(customViews.Count);
+                progressForm.Show();
+                Application.DoEvents();
+
+                // 12. カスタムビューごとのループ処理
+                for (int i = 0; i < customViews.Count; i++)
+                {
+                    // 中断チェック
+                    if (progressForm.StopRequested)
+                    {
+                        cancelCount = customViews.Count - i;
+                        lw.WriteLine("\n" + GetMessage("UserStopped"));
+                        break;
+                    }
+
+                    ModelingView view = customViews[i];
+
+                    // 進捗更新
+                    progressForm.UpdateProgress(view.Name, i + 1, customViews.Count);
+                    Application.DoEvents();
+
+                    lw.WriteLine(GetMessage("LwProcessing", i + 1, customViews.Count, view.Name));
+
+                    Stopwatch viewSw = Stopwatch.StartNew();
                     try
                     {
-                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
-                        lw.WriteLine("[バックグラウンド] 画面更新を復帰しました");
+                        ExportViewAsDxf(view, partName, outputFolder);
+                        viewSw.Stop();
+                        successCount++;
+                        lw.WriteLine(GetMessage("LwSuccess", viewSw.Elapsed.TotalSeconds));
                     }
                     catch (Exception ex)
                     {
-                        lw.WriteLine("[バックグラウンド] 画面更新復帰失敗: " + ex.Message);
+                        viewSw.Stop();
+                        failCount++;
+                        string errorMsg = string.Format("{0}: {1}", view.Name, ex.Message);
+                        errorDetails.Add(errorMsg);
+                        lw.WriteLine(GetMessage("LwFailed", viewSw.Elapsed.TotalSeconds, ex.Message));
+                        theSession.LogFile.WriteLine(GetMessage("LwViewExportFailed", view.Name, ex.Message));
                     }
 
-                    // フォーカスロック解除（エラー時も確実に解除）
-                    try
-                    {
-                        LockSetForegroundWindow(LSFW_UNLOCK);
-                    }
-                    catch { }
-
-                    // フォーカス監視を停止
-                    nxMainWindow = IntPtr.Zero;
+                    Application.DoEvents();
                 }
 
-                // 11. モデリングアプリケーションに戻る
+                // 13. 進捗ダイアログを閉じる
+                progressForm.Close();
+                progressForm.Dispose();
+                progressForm = null;
+
+                // 14. 画面更新を復帰
+                try
+                {
+                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                    lw.WriteLine(GetMessage("LwDisplayRestored"));
+                }
+                catch (Exception ex)
+                {
+                    lw.WriteLine(GetMessage("LwDisplayRestoreFailed", ex.Message));
+                }
+
+                // 15. モデリングアプリケーションに戻る
                 try
                 {
                     theSession.ApplicationSwitchImmediate("UG_APP_MODELING");
@@ -337,40 +481,60 @@ namespace NXCustomViewDxfExporter
                     // 既にモデリングの場合は無視
                 }
 
-                // 結果表示
+                // 16. リスティングウィンドウに結果を出力
                 totalSw.Stop();
                 lw.WriteLine("\n========================================");
-                lw.WriteLine("  処理結果");
+                lw.WriteLine("  " + GetMessage("ResultTitle"));
                 lw.WriteLine("========================================");
-                lw.WriteLine(string.Format("成功: {0} 件", successCount));
+                lw.WriteLine(GetMessage("SuccessCount", successCount));
                 if (failCount > 0)
-                    lw.WriteLine(string.Format("失敗: {0} 件", failCount));
-                if (cancelRequested)
-                    lw.WriteLine("※ ユーザーにより中止");
-                lw.WriteLine(string.Format("合計処理時間: {0:F1}秒", totalSw.Elapsed.TotalSeconds));
+                    lw.WriteLine(GetMessage("FailureCount", failCount));
+                if (cancelCount > 0)
+                    lw.WriteLine(GetMessage("CancelCount", cancelCount));
+                lw.WriteLine(GetMessage("LwTotalTime", totalSw.Elapsed.TotalSeconds));
                 lw.WriteLine("========================================");
 
-                string message = string.Format("DXFエクスポート完了: {0}ファイル出力しました", successCount);
-                if (failCount > 0)
+                // 17. 完了ダイアログを表示（OKボタン押下後にNXウィンドウを復帰）
+                using (var completionForm = new CompletionForm(
+                    successCount, failCount, cancelCount, errorDetails, outputFolder))
                 {
-                    message += string.Format("\n失敗: {0}件", failCount);
+                    completionForm.ShowDialog();
                 }
-                if (cancelRequested)
-                {
-                    message += "\n（ユーザーにより中止）";
-                }
-                theUI.NXMessageBox.Show("完了", NXMessageBox.DialogType.Information, message);
             }
             catch (Exception ex)
             {
-                lw.WriteLine("致命的エラー: " + ex.Message);
-                theUI.NXMessageBox.Show("エラー", NXMessageBox.DialogType.Error,
-                    string.Format("予期しないエラーが発生しました:\n{0}", ex.Message));
+                lw.WriteLine(GetMessage("FatalError", ex.Message));
+                theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
+                    GetMessage("UnexpectedError", ex.Message));
             }
             finally
             {
-                // 停止フォームが残っていたら閉じる
-                CloseCancelForm();
+                // 進捗ダイアログが残っていたら閉じる
+                if (progressForm != null)
+                {
+                    try { progressForm.Close(); progressForm.Dispose(); }
+                    catch { }
+                }
+
+                // 画面更新を復帰（エラー時も確実に復帰）
+                try
+                {
+                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                }
+                catch { }
+
+                // NXウィンドウを復帰（完了ダイアログのOK押下後）
+                if (nxMainWindow != IntPtr.Zero)
+                {
+                    ShowWindow(nxMainWindow, SW_RESTORE);
+                }
+
+                // フォーカスロック解除
+                try
+                {
+                    LockSetForegroundWindow(LSFW_UNLOCK);
+                }
+                catch { }
 
                 // UndoMarkまで戻す（図面シート等の変更を取り消す）
                 theSession.UndoToMark(undoMark, null);
@@ -432,11 +596,11 @@ namespace NXCustomViewDxfExporter
 
                 theSession.Parts.LoadOptions.SetSearchDirectories(
                     allDirs.ToArray(), allFlags.ToArray());
-                lw.WriteLine("[検索パス] LoadOptions.SetSearchDirectories 設定済み (" + allDirs.Count + "件)");
+                lw.WriteLine(GetMessage("LwSearchPathSet", allDirs.Count));
             }
             catch (Exception ex)
             {
-                lw.WriteLine("[検索パス] LoadOptions設定失敗（続行）: " + ex.Message);
+                lw.WriteLine(GetMessage("LwSearchPathFailed", ex.Message));
             }
 
             // 対策2: UF_ASSEMレベルで検索ディレクトリを設定
@@ -446,19 +610,16 @@ namespace NXCustomViewDxfExporter
                     1,
                     new string[] { partDir },
                     new bool[] { true });
-                lw.WriteLine("[検索パス] UF_ASSEM.SetSearchDirectories 設定済み");
+                lw.WriteLine(GetMessage("LwSearchPathAssemSet"));
             }
             catch (Exception ex)
             {
-                lw.WriteLine("[検索パス] UF_ASSEM設定失敗（続行）: " + ex.Message);
+                lw.WriteLine(GetMessage("LwSearchPathAssemFailed", ex.Message));
             }
         }
 
         /// <summary>
         /// パートファイルとその関連ファイルをTempディレクトリにコピー。
-        /// DXFトランスレータは%TEMP%と%TEMP%\2\に一時パートを作成し、
-        /// 元パートをファイル名のみで参照する。defの検索パス設定が効かない場合の
-        /// フォールバックとして、参照先にパートファイルを直接配置する。
         /// </summary>
         private static void CopyPartFilesToTemp(string partFullPath)
         {
@@ -483,11 +644,11 @@ namespace NXCustomViewDxfExporter
                 string destPath = Path.Combine(destDir, fileName);
                 File.Copy(srcPath, destPath, true);
                 tempPartCopies.Add(destPath);
-                lw.WriteLine("[検索パス] パートファイルをコピー: " + destPath);
+                lw.WriteLine(GetMessage("LwPartCopied", destPath));
             }
             catch (Exception ex)
             {
-                lw.WriteLine("[検索パス] パートコピー失敗（続行）: " + destDir + " - " + ex.Message);
+                lw.WriteLine(GetMessage("LwPartCopyFailed", destDir, ex.Message));
             }
         }
 
@@ -506,161 +667,6 @@ namespace NXCustomViewDxfExporter
         }
 
         // ================================================================
-        // 停止ボタン（別スレッドのモードレスフォーム）
-        // ================================================================
-
-        private static void ShowCancelForm(int totalViews)
-        {
-            cancelRequested = false;
-            cancelForm = null;
-
-            Thread uiThread = new Thread(() =>
-            {
-                Form form = new Form();
-                form.Text = "DXFエクスポート";
-                form.Width = 340;
-                form.Height = 130;
-                form.FormBorderStyle = FormBorderStyle.FixedToolWindow;
-                form.StartPosition = FormStartPosition.CenterScreen;
-                form.TopMost = true;
-
-                Label label = new Label();
-                label.Text = string.Format("0/{0} 処理中...", totalViews);
-                label.Dock = DockStyle.Top;
-                label.Height = 40;
-                label.Padding = new Padding(10, 10, 10, 0);
-                form.Controls.Add(label);
-
-                Button btn = new Button();
-                btn.Text = "処理を停止";
-                btn.Dock = DockStyle.Bottom;
-                btn.Height = 40;
-                btn.Click += (s, e) =>
-                {
-                    cancelRequested = true;
-                    btn.Enabled = false;
-                    btn.Text = "停止中...";
-                    label.Text = "現在のビュー処理完了後に停止します...";
-                };
-                form.Controls.Add(btn);
-
-                // フォーカス監視タイマー: NXが自動的にフォーカスを奪った場合に復元
-                System.Windows.Forms.Timer focusTimer = new System.Windows.Forms.Timer();
-                focusTimer.Interval = 100;
-                focusTimer.Tick += (s2, e2) =>
-                {
-                    try
-                    {
-                        IntPtr nxWnd = nxMainWindow;
-                        if (nxWnd == IntPtr.Zero) return;
-
-                        IntPtr fg = GetForegroundWindow();
-                        if (fg != IntPtr.Zero && fg != nxWnd && fg != form.Handle)
-                        {
-                            // NX以外のウィンドウがアクティブ → ユーザーの作業ウィンドウとして記憶
-                            lastNonNxForeground = fg;
-                        }
-                        else if (fg == nxWnd)
-                        {
-                            // NXがフォーカスを奪った → ユーザーのウィンドウに戻す
-                            RestoreFocus();
-                        }
-                    }
-                    catch { }
-                };
-                focusTimer.Start();
-                form.FormClosed += (s2, e2) => focusTimer.Dispose();
-
-                cancelForm = form;
-                Application.Run(form);
-            });
-            uiThread.SetApartmentState(ApartmentState.STA);
-            uiThread.IsBackground = true;
-            uiThread.Start();
-
-            // フォームが初期化されるまで少し待つ
-            Thread.Sleep(300);
-        }
-
-        private static void UpdateCancelFormProgress(int current, int total, string viewName)
-        {
-            try
-            {
-                Form form = cancelForm;
-                if (form != null && form.IsHandleCreated && !form.IsDisposed)
-                {
-                    form.Invoke(new Action(() =>
-                    {
-                        if (form.Controls.Count > 0)
-                        {
-                            // Labelはindex 0（最初に追加したコントロール）
-                            form.Controls[0].Text = string.Format(
-                                "[{0}/{1}] {2}", current, total, viewName);
-                        }
-                    }));
-                }
-            }
-            catch { }
-        }
-
-        private static void CloseCancelForm()
-        {
-            try
-            {
-                Form form = cancelForm;
-                if (form != null && form.IsHandleCreated && !form.IsDisposed)
-                {
-                    form.Invoke(new Action(() => form.Close()));
-                }
-                cancelForm = null;
-            }
-            catch { }
-        }
-
-        // ================================================================
-        // フォーカス復元（AttachThreadInput方式）
-        // ================================================================
-
-        /// <summary>
-        /// NXがフォーカスを奪った場合、ユーザーの作業ウィンドウにフォーカスを戻す。
-        /// AttachThreadInputで現在のフォアグラウンドスレッドにアタッチしてから
-        /// SetForegroundWindowを呼ぶことで、確実にフォーカスを変更する。
-        /// </summary>
-        private static void RestoreFocus()
-        {
-            try
-            {
-                IntPtr target = lastNonNxForeground;
-                if (target == IntPtr.Zero) return;
-
-                IntPtr currentForeground = GetForegroundWindow();
-                if (currentForeground == target) return;
-
-                uint currentThreadId = GetCurrentThreadId();
-                uint foregroundThreadId = GetWindowThreadProcessId(currentForeground, out _);
-
-                bool attached = false;
-                if (currentThreadId != foregroundThreadId)
-                {
-                    attached = AttachThreadInput(currentThreadId, foregroundThreadId, true);
-                }
-
-                try
-                {
-                    SetForegroundWindow(target);
-                }
-                finally
-                {
-                    if (attached)
-                    {
-                        AttachThreadInput(currentThreadId, foregroundThreadId, false);
-                    }
-                }
-            }
-            catch { }
-        }
-
-        // ================================================================
         // フォルダ選択
         // ================================================================
 
@@ -669,7 +675,7 @@ namespace NXCustomViewDxfExporter
             string selectedPath = null;
             using (FolderBrowserDialog dialog = new FolderBrowserDialog())
             {
-                dialog.Description = "DXFファイルの出力先フォルダを選択してください";
+                dialog.Description = GetMessage("FolderSelectTitle");
                 dialog.ShowNewFolderButton = true;
                 if (dialog.ShowDialog() == DialogResult.OK)
                 {
@@ -735,14 +741,12 @@ namespace NXCustomViewDxfExporter
                 NXObject sheetObj = sheetBuilder.Commit();
                 sheet = (DrawingSheet)sheetObj;
                 sheetBuilder.Destroy();
-                RestoreFocus();
 
                 // ジャーナル準拠: テンプレートインスタンス化完了を通知
                 workPart.Drafting.SetTemplateInstantiationIsComplete(true);
 
                 // シートを開く
                 sheet.Open();
-                RestoreFocus();
 
                 // c. ベースビューの配置（ジャーナル準拠）
                 workPart.DraftingManager.DrawingsFreezeOutOfDateComputation();
@@ -789,7 +793,6 @@ namespace NXCustomViewDxfExporter
 
                 workPart.DraftingManager.DrawingsUnfreezeOutOfDateComputation();
                 baseViewBuilder.Destroy();
-                RestoreFocus();
 
                 // d. DXFエクスポート（ジャーナル準拠の順序）
                 string dxfFileName = string.Format("{0}_{1}.dxf", partName, view.Name);
@@ -828,12 +831,10 @@ namespace NXCustomViewDxfExporter
 
                 dxfCreator.Commit();
                 dxfCreator.Destroy();
-                RestoreFocus();
 
                 // e. クリーンアップ：ビューとシートを削除
                 CleanupViewAndSheet(baseViewObj, sheet, viewUndoMark);
                 sheet = null;
-                RestoreFocus();
             }
             catch
             {
@@ -985,6 +986,228 @@ namespace NXCustomViewDxfExporter
         public static int GetUnloadOption(string dummy)
         {
             return (int)Session.LibraryUnloadOption.Immediately;
+        }
+
+        // ================================================================
+        // 進捗ダイアログ（ProgressForm）
+        // ================================================================
+
+        private class ProgressForm : Form
+        {
+            private Label labelProgress;
+            private ProgressBar progressBar;
+            private Label labelPercent;
+            private Button btnStop;
+
+            public bool StopRequested { get; private set; }
+
+            public ProgressForm(int totalViews)
+            {
+                StopRequested = false;
+
+                this.Text = GetMessage("ProgressTitle");
+                this.Width = 400;
+                this.Height = 200;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.StartPosition = FormStartPosition.CenterScreen;
+                this.TopMost = true;
+                this.ShowInTaskbar = true;
+                this.Font = GetUIFont(9f);
+
+                // ×ボタンの無効化（FormClosingでキャンセル）
+                this.FormClosing += (s, e) =>
+                {
+                    if (e.CloseReason == CloseReason.UserClosing)
+                        e.Cancel = true;
+                };
+
+                labelProgress = new Label();
+                labelProgress.Text = GetMessage("ProgressMessage", "...", 0, totalViews);
+                labelProgress.Location = new System.Drawing.Point(20, 20);
+                labelProgress.Size = new System.Drawing.Size(350, 25);
+                labelProgress.Font = GetUIFont(10f);
+                this.Controls.Add(labelProgress);
+
+                progressBar = new ProgressBar();
+                progressBar.Location = new System.Drawing.Point(20, 55);
+                progressBar.Size = new System.Drawing.Size(280, 25);
+                progressBar.Minimum = 0;
+                progressBar.Maximum = totalViews;
+                progressBar.Value = 0;
+                this.Controls.Add(progressBar);
+
+                labelPercent = new Label();
+                labelPercent.Text = "0%";
+                labelPercent.Location = new System.Drawing.Point(310, 58);
+                labelPercent.Size = new System.Drawing.Size(50, 25);
+                labelPercent.Font = GetUIFont(10f);
+                this.Controls.Add(labelPercent);
+
+                btnStop = new Button();
+                btnStop.Text = GetMessage("StopButton");
+                btnStop.Location = new System.Drawing.Point(140, 100);
+                btnStop.Size = new System.Drawing.Size(120, 40);
+                btnStop.BackColor = Color.FromArgb(220, 53, 69);
+                btnStop.ForeColor = Color.White;
+                btnStop.FlatStyle = FlatStyle.Flat;
+                btnStop.Font = GetUIFont(10f, FontStyle.Bold);
+                btnStop.Click += btnStop_Click;
+                this.Controls.Add(btnStop);
+            }
+
+            private void btnStop_Click(object sender, EventArgs e)
+            {
+                StopRequested = true;
+                btnStop.Enabled = false;
+                btnStop.Text = GetMessage("StopRequesting");
+            }
+
+            public void UpdateProgress(string viewName, int current, int total)
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() => UpdateProgress(viewName, current, total)));
+                    return;
+                }
+                labelProgress.Text = GetMessage("ProgressMessage", viewName, current, total);
+                progressBar.Maximum = total;
+                progressBar.Value = current;
+                labelPercent.Text = string.Format("{0}%", (int)((double)current / total * 100));
+            }
+        }
+
+        // ================================================================
+        // 完了ダイアログ（CompletionForm）
+        // ================================================================
+
+        private class CompletionForm : Form
+        {
+            public CompletionForm(int successCount, int failCount, int cancelCount,
+                List<string> errors, string outputPath)
+            {
+                bool hasErrors = failCount > 0 || cancelCount > 0;
+
+                this.Text = hasErrors ? GetMessage("CompleteTitleError") : GetMessage("CompleteTitleSuccess");
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.StartPosition = FormStartPosition.CenterScreen;
+                this.TopMost = true;
+                this.ShowInTaskbar = true;
+                this.Font = GetUIFont(9f);
+
+                int y = 20;
+
+                // ステータスアイコン + メッセージ
+                Label labelStatus = new Label();
+                if (hasErrors)
+                {
+                    labelStatus.Text = "\u26A0 " + GetMessage("CompleteMessageError");
+                    labelStatus.ForeColor = Color.FromArgb(255, 152, 0);
+                }
+                else
+                {
+                    labelStatus.Text = "\u2713 " + GetMessage("CompleteMessage");
+                    labelStatus.ForeColor = Color.FromArgb(40, 167, 69);
+                }
+                labelStatus.Location = new System.Drawing.Point(20, y);
+                labelStatus.Size = new System.Drawing.Size(400, 30);
+                labelStatus.Font = GetUIFont(11f, FontStyle.Bold);
+                this.Controls.Add(labelStatus);
+                y += 40;
+
+                // 成功数
+                Label labelSuccess = new Label();
+                labelSuccess.Text = GetMessage("SuccessCount", successCount);
+                labelSuccess.Location = new System.Drawing.Point(30, y);
+                labelSuccess.Size = new System.Drawing.Size(380, 22);
+                labelSuccess.ForeColor = Color.FromArgb(40, 167, 69);
+                labelSuccess.Font = GetUIFont(10f);
+                this.Controls.Add(labelSuccess);
+                y += 25;
+
+                // 失敗数
+                if (failCount > 0)
+                {
+                    Label labelFail = new Label();
+                    labelFail.Text = GetMessage("FailureCount", failCount);
+                    labelFail.Location = new System.Drawing.Point(30, y);
+                    labelFail.Size = new System.Drawing.Size(380, 22);
+                    labelFail.ForeColor = Color.FromArgb(220, 53, 69);
+                    labelFail.Font = GetUIFont(10f);
+                    this.Controls.Add(labelFail);
+                    y += 25;
+                }
+
+                // 中断数
+                if (cancelCount > 0)
+                {
+                    Label labelCancel = new Label();
+                    labelCancel.Text = GetMessage("CancelCount", cancelCount);
+                    labelCancel.Location = new System.Drawing.Point(30, y);
+                    labelCancel.Size = new System.Drawing.Size(380, 22);
+                    labelCancel.ForeColor = Color.FromArgb(255, 152, 0);
+                    labelCancel.Font = GetUIFont(10f);
+                    this.Controls.Add(labelCancel);
+                    y += 25;
+                }
+
+                // 出力先パス
+                Label labelOutput = new Label();
+                labelOutput.Text = GetMessage("OutputPath", outputPath);
+                labelOutput.Location = new System.Drawing.Point(30, y);
+                labelOutput.Size = new System.Drawing.Size(380, 22);
+                labelOutput.Font = GetUIFont(9f);
+                this.Controls.Add(labelOutput);
+                y += 30;
+
+                // エラー詳細
+                if (errors != null && errors.Count > 0)
+                {
+                    Label labelErrorHeader = new Label();
+                    labelErrorHeader.Text = GetMessage("ErrorDetails");
+                    labelErrorHeader.Location = new System.Drawing.Point(30, y);
+                    labelErrorHeader.Size = new System.Drawing.Size(380, 22);
+                    labelErrorHeader.Font = GetUIFont(9f, FontStyle.Bold);
+                    this.Controls.Add(labelErrorHeader);
+                    y += 25;
+
+                    foreach (string error in errors)
+                    {
+                        Label labelError = new Label();
+                        labelError.Text = "  " + error;
+                        labelError.Location = new System.Drawing.Point(30, y);
+                        labelError.Size = new System.Drawing.Size(380, 40);
+                        labelError.ForeColor = Color.FromArgb(220, 53, 69);
+                        labelError.Font = GetUIFont(9f);
+                        this.Controls.Add(labelError);
+                        y += 40;
+                    }
+                }
+
+                y += 10;
+
+                // OKボタン
+                Button btnOk = new Button();
+                btnOk.Text = GetMessage("OkButton");
+                btnOk.Location = new System.Drawing.Point(170, y);
+                btnOk.Size = new System.Drawing.Size(100, 35);
+                btnOk.Font = GetUIFont(10f);
+                btnOk.Click += (s, e) =>
+                {
+                    this.DialogResult = DialogResult.OK;
+                    this.Close();
+                };
+                this.Controls.Add(btnOk);
+                this.AcceptButton = btnOk;
+
+                y += 55;
+
+                this.Width = 450;
+                this.Height = y;
+            }
         }
     }
 }
