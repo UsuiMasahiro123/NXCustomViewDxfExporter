@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using NXOpen;
@@ -25,6 +26,71 @@ namespace NXCustomViewDxfExporter
         private const int SW_MINIMIZE = 6;
         private const int SW_RESTORE = 9;
 
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        private const int SW_HIDE = 0;
+        private const int SW_SHOWNOACTIVATE = 8;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT { public int X, Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINDOWPLACEMENT
+        {
+            public uint length;
+            public uint flags;
+            public uint showCmd;
+            public POINT ptMinPosition;
+            public POINT ptMaxPosition;
+            public RECT rcNormalPosition;
+        }
+
         private static Session theSession;
         private static UFSession theUFSession;
         private static UI theUI;
@@ -37,8 +103,21 @@ namespace NXCustomViewDxfExporter
         // Tempにコピーしたパートファイルのパス（終了時に削除）
         private static readonly List<string> tempPartCopies = new List<string>();
 
-        // NXメインウィンドウハンドル
-        private static IntPtr nxMainWindow = IntPtr.Zero;
+        // NXプロセスのウィンドウハンドル一覧と元の配置（保存・復元用）
+        private static readonly List<IntPtr> nxWindows = new List<IntPtr>();
+        private static readonly Dictionary<IntPtr, WINDOWPLACEMENT> _savedPlacements = new Dictionary<IntPtr, WINDOWPLACEMENT>();
+
+        // NXダイアログ監視タイマー
+        private static System.Threading.Timer _nxDialogSuppressor;
+
+        // 進捗ダイアログのウィンドウハンドル（監視対象から除外用）
+        private static IntPtr _progressFormHandle = IntPtr.Zero;
+
+        // フォーカス奪取防止: ユーザーが操作中のウィンドウを追跡
+        private static IntPtr _userForegroundWindow = IntPtr.Zero;
+
+        // 処理中に非表示にしたNXダイアログの追跡（クリーンアップ時に閉じるため）
+        private static readonly HashSet<IntPtr> _suppressedWindows = new HashSet<IntPtr>();
 
         // 言語設定
         private static bool isJapanese;
@@ -317,8 +396,9 @@ namespace NXCustomViewDxfExporter
             List<string> errorDetails = new List<string>();
             string outputFolder = null;
 
-            nxMainWindow = Process.GetCurrentProcess().MainWindowHandle;
+            CollectNxWindows();
             ProgressForm progressForm = null;
+            Thread progressThread = null;
 
             try
             {
@@ -397,9 +477,9 @@ namespace NXCustomViewDxfExporter
                 undoMark = theSession.SetUndoMark(Session.MarkVisibility.Invisible, "DXF Export");
                 undoMarkCreated = true;
 
-                // 9. 情報ウィンドウを閉じてからNXウィンドウを最小化
+                // 9. NXの全ウィンドウを最小化（メイン＋情報ウィンドウ等）
                 lw.Close();
-                ShowWindow(nxMainWindow, SW_MINIMIZE);
+                MinimizeAllNxWindows();
 
                 // 10. フォーカスロック
                 try
@@ -412,74 +492,135 @@ namespace NXCustomViewDxfExporter
                 theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
                 displaySuppressed = true;
 
-                // 12. 進捗ダイアログを表示（メインスレッド）
-                progressForm = new ProgressForm(customViews.Count);
-                progressForm.Show();
-                Application.DoEvents();
-
-                // 13. カスタムビューごとのループ処理
-                for (int i = 0; i < customViews.Count; i++)
+                // 12. 進捗ダイアログを専用STAスレッドで表示（NXOpen APIブロック中も操作可能）
+                ManualResetEvent formReady = new ManualResetEvent(false);
+                progressThread = new Thread(() =>
                 {
-                    // 中断チェック
-                    if (progressForm.StopRequested)
+                    progressForm = new ProgressForm(customViews.Count);
+                    progressForm.HandleCreated += (s, e) =>
                     {
-                        cancelCount = customViews.Count - i;
-                        break;
-                    }
+                        _progressFormHandle = progressForm.Handle;
+                        formReady.Set();
+                    };
+                    Application.Run(progressForm);
+                    // Application.Run終了 = ForceCloseされた
+                    progressForm.Dispose();
+                    progressForm = null;
+                });
+                progressThread.SetApartmentState(ApartmentState.STA);
+                progressThread.IsBackground = true;
+                progressThread.Start();
+                formReady.WaitOne(5000);
 
-                    ModelingView view = customViews[i];
-
-                    // 進捗更新
-                    progressForm.UpdateProgress(view.Name, i + 1, customViews.Count);
-                    Application.DoEvents();
-
-                    Stopwatch viewSw = Stopwatch.StartNew();
-                    try
+                // 13. NXダイアログ監視タイマー開始 + カスタムビューごとのループ処理
+                _userForegroundWindow = GetForegroundWindow();
+                StartNxDialogSuppressor();
+                try
+                {
+                    for (int i = 0; i < customViews.Count; i++)
                     {
-                        ExportViewAsDxf(view, partName, outputFolder);
-                        viewSw.Stop();
-                        successCount++;
-                    }
-                    catch (Exception ex)
-                    {
-                        viewSw.Stop();
-                        failCount++;
-                        string errorMsg = string.Format("{0}: {1}", view.Name, ex.Message);
-                        errorDetails.Add(errorMsg);
-                    }
+                        // 中断チェック
+                        if (progressForm != null && progressForm.StopRequested)
+                        {
+                            cancelCount = customViews.Count - i;
+                            break;
+                        }
 
-                    Application.DoEvents();
+                        ModelingView view = customViews[i];
+
+                        // 進捗更新
+                        if (progressForm != null)
+                            progressForm.UpdateProgress(view.Name, i + 1, customViews.Count);
+
+                        Stopwatch viewSw = Stopwatch.StartNew();
+                        try
+                        {
+                            ExportViewAsDxf(view, partName, outputFolder);
+                            viewSw.Stop();
+                            successCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            viewSw.Stop();
+                            failCount++;
+                            string errorMsg = string.Format("{0}: {1}", view.Name, ex.Message);
+                            errorDetails.Add(errorMsg);
+                        }
+                    }
+                }
+                finally
+                {
+                    // 注: ここではSuppressorを停止しない。
+                    // クリーンアップ中もNXダイアログを抑制し続ける必要がある。
                 }
 
                 // === ループ終了後のクリーンアップ（順序が重要！） ===
 
-                // Step 1: 進捗ダイアログを閉じる
+                bool userStopped = (cancelCount > 0);
+
+                // Step 1: 進捗ダイアログを閉じる（STAスレッドのApplication.Runを終了）
+                _progressFormHandle = IntPtr.Zero;
                 if (progressForm != null)
                 {
-                    progressForm.Close();
-                    progressForm.Dispose();
+                    try { progressForm.ForceClose(); } catch { }
                     progressForm = null;
                 }
-
-                // Step 2: 画面更新を復帰（完了ダイアログ表示前に必ず）
-                if (displaySuppressed)
+                // スレッド完了を待つ（DLLアンロード時のクラッシュ防止）
+                if (progressThread != null && progressThread.IsAlive)
                 {
-                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
-                    displaySuppressed = false;
-                    Thread.Sleep(100);
+                    progressThread.Join(2000);
                 }
 
-                // Step 3: UndoMarkで状態を復元（完了ダイアログ表示前に）
-                SafeUndoAndCleanup(theSession, ref undoMark, ref undoMarkCreated);
-
-                // Step 4: モデリングアプリケーションに戻る
-                try
+                if (userStopped)
                 {
-                    theSession.ApplicationSwitchImmediate("UG_APP_MODELING");
-                }
-                catch { }
+                    // === ユーザー停止: NXバックグラウンドDXF翻訳との競合を回避 ===
 
-                // Step 5: リスティングウィンドウに結果を出力
+                    // 最優先: NXウィンドウを即座に復元（応答性向上）
+                    StopNxDialogSuppressor();
+                    // 非表示ダイアログは再表示しない（DXF翻訳中のダイアログ操作はクラッシュ原因）
+                    lock (_suppressedWindows) { _suppressedWindows.Clear(); }
+                    RestoreAllNxWindows();
+                    try { LockSetForegroundWindow(LSFW_UNLOCK); } catch { }
+
+                    // 画面更新を復帰
+                    if (displaySuppressed)
+                    {
+                        try { theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY); }
+                        catch { }
+                        displaySuppressed = false;
+                    }
+
+                    // UndoToMarkをスキップ（バックグラウンドDXF翻訳中のUndoはNXクラッシュの原因）
+                    // 各ビューのCleanupViewAndSheetで個別変更は既に巻き戻し済み
+                    undoMarkCreated = false;
+                }
+                else
+                {
+                    // === 正常完了: フルクリーンアップ ===
+
+                    // 画面更新を復帰
+                    if (displaySuppressed)
+                    {
+                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                        displaySuppressed = false;
+                        Thread.Sleep(50);
+                    }
+
+                    // UndoMarkで状態を復元
+                    SafeUndoAndCleanup(theSession, ref undoMark, ref undoMarkCreated);
+
+                    // モデリングアプリケーションに戻る
+                    try { theSession.ApplicationSwitchImmediate("UG_APP_MODELING"); }
+                    catch { }
+
+                    // NXダイアログ監視を停止し、NXウィンドウを復元
+                    StopNxDialogSuppressor();
+                    DismissSuppressedDialogs();
+                    RestoreAllNxWindows();
+                    try { LockSetForegroundWindow(LSFW_UNLOCK); } catch { }
+                }
+
+                // リスティングウィンドウに結果を出力
                 totalSw.Stop();
                 try
                 {
@@ -497,25 +638,34 @@ namespace NXCustomViewDxfExporter
                 }
                 catch { }
 
-                // Step 6: 完了ダイアログを表示
+                // 完了ダイアログを表示
                 using (var completionForm = new CompletionForm(
                     successCount, failCount, cancelCount, errorDetails, outputFolder))
                 {
                     completionForm.ShowDialog();
                 }
-                // completionFormはここでDispose済み
+
+                // 停止時: 完了ダイアログ後にモデリング復帰を試行
+                // （ユーザーがダイアログを閲覧中にDXF翻訳が完了している可能性が高い）
+                if (userStopped)
+                {
+                    try { theSession.ApplicationSwitchImmediate("UG_APP_MODELING"); }
+                    catch { }
+                }
             }
             catch (Exception ex)
             {
                 // 全ての例外をキャッチ（NXに伝播させない）
                 try
                 {
+                    _progressFormHandle = IntPtr.Zero;
                     if (progressForm != null)
                     {
-                        progressForm.Close();
-                        progressForm.Dispose();
+                        progressForm.ForceClose();
                         progressForm = null;
                     }
+                    if (progressThread != null && progressThread.IsAlive)
+                        progressThread.Join(2000);
                 }
                 catch { }
 
@@ -532,13 +682,31 @@ namespace NXCustomViewDxfExporter
             finally
             {
                 // 確実に復帰（二重呼び出し防止のフラグ付き）
+
                 try
                 {
+                    _progressFormHandle = IntPtr.Zero;
                     if (progressForm != null)
                     {
-                        progressForm.Close();
-                        progressForm.Dispose();
+                        progressForm.ForceClose();
+                        progressForm = null;
                     }
+                    if (progressThread != null && progressThread.IsAlive)
+                        progressThread.Join(2000);
+                }
+                catch { }
+
+                try
+                {
+                    StopNxDialogSuppressor();
+                    lock (_suppressedWindows) { _suppressedWindows.Clear(); }
+                }
+                catch { }
+
+                try
+                {
+                    RestoreAllNxWindows();
+                    LockSetForegroundWindow(LSFW_UNLOCK);
                 }
                 catch { }
 
@@ -554,18 +722,6 @@ namespace NXCustomViewDxfExporter
                 try
                 {
                     SafeUndoAndCleanup(theSession, ref undoMark, ref undoMarkCreated);
-                }
-                catch { }
-
-                // NXウィンドウ復帰
-                try
-                {
-                    if (nxMainWindow != IntPtr.Zero)
-                    {
-                        ShowWindow(nxMainWindow, SW_RESTORE);
-                        Thread.Sleep(200);
-                    }
-                    LockSetForegroundWindow(LSFW_UNLOCK);
                 }
                 catch { }
 
@@ -934,6 +1090,198 @@ namespace NXCustomViewDxfExporter
         }
 
         // ================================================================
+        // NXメインウィンドウ検索
+        // ================================================================
+
+        private static void CollectNxWindows()
+        {
+            nxWindows.Clear();
+            _savedPlacements.Clear();
+            uint currentPid = (uint)Process.GetCurrentProcess().Id;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                uint windowPid;
+                GetWindowThreadProcessId(hWnd, out windowPid);
+                if (windowPid == currentPid && IsWindowVisible(hWnd))
+                {
+                    nxWindows.Add(hWnd);
+                    // ウィンドウの配置情報を保存（最大化状態等を復元するため）
+                    WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+                    wp.length = (uint)Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+                    GetWindowPlacement(hWnd, ref wp);
+                    _savedPlacements[hWnd] = wp;
+                }
+                return true;
+            }, IntPtr.Zero);
+        }
+
+        private static void MinimizeAllNxWindows()
+        {
+            foreach (IntPtr hWnd in nxWindows)
+            {
+                ShowWindow(hWnd, SW_MINIMIZE);
+            }
+        }
+
+        private static void RestoreAllNxWindows()
+        {
+            // 保存した配置情報で復元（最大化状態等を正確に再現）
+            foreach (var kvp in _savedPlacements)
+            {
+                WINDOWPLACEMENT wp = kvp.Value;
+                SetWindowPlacement(kvp.Key, ref wp);
+            }
+            Thread.Sleep(100);
+        }
+
+        // ================================================================
+        // NX「作業進行中」ダイアログ監視・非表示
+        // ================================================================
+
+        private static void StartNxDialogSuppressor()
+        {
+            uint currentProcessId = (uint)Process.GetCurrentProcess().Id;
+            lock (_suppressedWindows) { _suppressedWindows.Clear(); }
+
+            _nxDialogSuppressor = new System.Threading.Timer(_ =>
+            {
+                try
+                {
+                    SuppressNxDialogs(currentProcessId);
+                }
+                catch
+                {
+                    // タイマー内の例外は無視（安全性優先）
+                }
+            }, null, 0, 50); // 50msごとに監視（ダイアログ出現を即座に検出）
+        }
+
+        private static void StopNxDialogSuppressor()
+        {
+            var timer = _nxDialogSuppressor;
+            _nxDialogSuppressor = null;
+            if (timer != null)
+            {
+                // 最後のコールバック完了を待ってから破棄（レースコンディション防止）
+                using (var waitHandle = new ManualResetEvent(false))
+                {
+                    timer.Dispose(waitHandle);
+                    waitHandle.WaitOne(200);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 処理中に非表示にしたNXダイアログを再表示し、NXが自然にクローズするのを待つ。
+        /// WM_CLOSEによる強制クローズはNX内部スレッドのクラッシュ原因になるため使用しない。
+        /// </summary>
+        private static void DismissSuppressedDialogs()
+        {
+            List<IntPtr> windows;
+            lock (_suppressedWindows)
+            {
+                windows = new List<IntPtr>(_suppressedWindows);
+                _suppressedWindows.Clear();
+            }
+
+            if (windows.Count == 0)
+                return;
+
+            // 非表示にしたダイアログを再表示（フォーカスは奪わない）
+            foreach (IntPtr hWnd in windows)
+            {
+                ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+            }
+
+            // NXがダイアログを自動的に閉じるのを待つ（最大1秒、100msごとにチェック）
+            for (int i = 0; i < 10; i++)
+            {
+                Thread.Sleep(100);
+                bool anyVisible = false;
+                foreach (IntPtr hWnd in windows)
+                {
+                    if (IsWindowVisible(hWnd))
+                    {
+                        anyVisible = true;
+                        break;
+                    }
+                }
+                if (!anyVisible)
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 処理中にNXプロセスが新規表示したウィンドウを非表示にし、
+        /// NXがフォーカスを奪った場合はユーザーの元のウィンドウに復元する。
+        /// </summary>
+        private static void SuppressNxDialogs(uint targetProcessId)
+        {
+            IntPtr progressHandle = _progressFormHandle;
+
+            // 1. NXプロセスが新たに表示したウィンドウを非表示にする
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd))
+                    return true;
+
+                // 自分のProgressFormはスキップ
+                if (progressHandle != IntPtr.Zero && hWnd == progressHandle)
+                    return true;
+
+                // NXプロセスのウィンドウか確認
+                uint processId;
+                GetWindowThreadProcessId(hWnd, out processId);
+                if (processId != targetProcessId)
+                    return true;
+
+                if (nxWindows.Contains(hWnd))
+                {
+                    // 処理開始前に記録済みのNXウィンドウが復元された → 再最小化
+                    if (!IsIconic(hWnd))
+                        ShowWindow(hWnd, SW_MINIMIZE);
+                }
+                else
+                {
+                    // NXプロセスが新たに表示したウィンドウ → 非表示にする
+                    ShowWindow(hWnd, SW_HIDE);
+                    lock (_suppressedWindows) { _suppressedWindows.Add(hWnd); }
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            // 2. NXがフォーカスを奪っていたら、ユーザーの元のウィンドウに復元
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero)
+                return;
+
+            // ProgressFormがフォアグラウンドなら問題なし
+            if (progressHandle != IntPtr.Zero && fg == progressHandle)
+                return;
+
+            uint fgProcessId;
+            uint fgThreadId = GetWindowThreadProcessId(fg, out fgProcessId);
+            if (fgProcessId != targetProcessId)
+            {
+                // ユーザーが別アプリを操作中 → そのウィンドウを記憶
+                _userForegroundWindow = fg;
+                return;
+            }
+
+            // NXがフォーカスを奪っている → ユーザーの元のウィンドウに返す
+            IntPtr target = _userForegroundWindow;
+            if (target == IntPtr.Zero)
+                return;
+
+            uint curThreadId = GetCurrentThreadId();
+            AttachThreadInput(curThreadId, fgThreadId, true);
+            SetForegroundWindow(target);
+            AttachThreadInput(curThreadId, fgThreadId, false);
+        }
+
+        // ================================================================
         // CGMダイアログ抑制
         // ================================================================
 
@@ -1054,12 +1402,15 @@ namespace NXCustomViewDxfExporter
             private ProgressBar progressBar;
             private Label labelPercent;
             private Button btnStop;
+            private volatile bool _stopRequested;
+            private bool _allowClose;
 
-            public bool StopRequested { get; private set; }
+            public bool StopRequested => _stopRequested;
 
             public ProgressForm(int totalViews)
             {
-                StopRequested = false;
+                _stopRequested = false;
+                _allowClose = false;
 
                 this.Text = GetMessage("ProgressTitle");
                 this.Width = 400;
@@ -1072,10 +1423,10 @@ namespace NXCustomViewDxfExporter
                 this.ShowInTaskbar = true;
                 this.Font = GetUIFont(9f);
 
-                // ×ボタンの無効化（FormClosingでキャンセル）
+                // ×ボタンの無効化（ForceClose以外では閉じさせない）
                 this.FormClosing += (s, e) =>
                 {
-                    if (e.CloseReason == CloseReason.UserClosing)
+                    if (!_allowClose && e.CloseReason == CloseReason.UserClosing)
                         e.Cancel = true;
                 };
 
@@ -1115,7 +1466,7 @@ namespace NXCustomViewDxfExporter
 
             private void btnStop_Click(object sender, EventArgs e)
             {
-                StopRequested = true;
+                _stopRequested = true;
                 btnStop.Enabled = false;
                 btnStop.Text = GetMessage("StopRequesting");
             }
@@ -1131,6 +1482,20 @@ namespace NXCustomViewDxfExporter
                 progressBar.Maximum = total;
                 progressBar.Value = current;
                 labelPercent.Text = string.Format("{0}%", (int)((double)current / total * 100));
+            }
+
+            /// <summary>
+            /// 別スレッドから安全にフォームを閉じる。Application.Runを終了させる。
+            /// </summary>
+            public void ForceClose()
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(ForceClose));
+                    return;
+                }
+                _allowClose = true;
+                Close();
             }
         }
 
