@@ -40,7 +40,27 @@
       "Bash(echo:*)",
       "Bash(git credential:*)",
       "Bash(\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"C:\\\\Users\\\\tcadmin\\\\source\\\\repos\\\\NXOpenTest\\\\NXCustomViewDxfExporter\\\\NXCustomViewDxfExporter.csproj\" -p:Configuration=Debug -p:Platform=x64)",
-      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" \"C:/Users/tcadmin/source/repos/NXOpenTest/NXCustomViewDxfExporter/NXCustomViewDxfExporter.csproj\" -p:Configuration=Debug -p:Platform=x64)"
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" \"C:/Users/tcadmin/source/repos/NXOpenTest/NXCustomViewDxfExporter/NXCustomViewDxfExporter.csproj\" -p:Configuration=Debug -p:Platform=x64)",
+      "Bash(cd \"C:/Users/tcadmin/source/repos/NXCustomViewDxfExporter\" && \"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" NXCustomViewDxfExporter/NXCustomViewDxfExporter.csproj /p:Configuration=Debug /p:Platform=x64 /v:minimal 2>&1)",
+      "Bash(cd \"C:/Users/tcadmin/source/repos/NXCustomViewDxfExporter\" && \"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" NXCustomViewDxfExporter/NXCustomViewDxfExporter.csproj /p:Configuration=Debug /p:Platform=x64 /v:minimal 2>&1)",
+      "Bash(cd \"C:/Users/tcadmin/source/repos/NXCustomViewDxfExporter\" && cmd.exe /c '\"\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" NXCustomViewDxfExporter\\\\NXCustomViewDxfExporter.csproj /p:Configuration=Debug /p:Platform=x64 /v:minimal' 2>&1)",
+      "Bash(cmd.exe:*)",
+      "Bash(msbuild:*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\":*)",
+      "Bash(\"/c/Windows/Microsoft.NET/Framework64/v4.0.30319/MSBuild.exe\":*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\":*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\":*)",
+      "Bash(\"$MSBUILDER\":*)",
+      "Bash(tasklist.exe:*)",
+      "Bash(taskkill.exe:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(\"/c/Program Files/Siemens/NX2312/NXBIN/SignDotNet.exe\":*)",
+      "Bash(where ffmpeg:*)",
+      "Bash(grep:*)",
+      "Bash(\"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" //t:Rebuild //p:Configuration=Debug //p:Platform=x64 \"C:\\\\\\\\Users\\\\\\\\tcadmin\\\\\\\\source\\\\\\\\repos\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter.csproj\")",
+      "Bash(powershell.exe -Command \"Stop-Process -Name ugraf -Force -ErrorAction SilentlyContinue\" 2>/dev/null; \"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" //t:Rebuild //p:Configuration=Debug //p:Platform=x64 \"C:\\\\\\\\Users\\\\\\\\tcadmin\\\\\\\\source\\\\\\\\repos\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter.csproj\")",
+      "Bash(powershell.exe -Command \"Stop-Process -Name ugraf -Force -ErrorAction SilentlyContinue\" 2>/dev/null; \"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" //t:Rebuild //p:Configuration=Release //p:Platform=x64 \"C:\\\\\\\\Users\\\\\\\\tcadmin\\\\\\\\source\\\\\\\\repos\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter.csproj\")",
+      "Bash(powershell.exe -Command \"Stop-Process -Name ugraf -Force -ErrorAction SilentlyContinue\" 2>/dev/null; rm -f \"C:/Users/tcadmin/source/repos/NXCustomViewDxfExporter/NXCustomViewDxfExporter/bin/x64/Debug/NXCustomViewDxfExporter.dll\" \"C:/Users/tcadmin/source/repos/NXCustomViewDxfExporter/NXCustomViewDxfExporter/bin/x64/Debug/NXCustomViewDxfExporter.pdb\" && \"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" //t:Clean //p:Configuration=Debug //p:Platform=x64 \"C:\\\\\\\\Users\\\\\\\\tcadmin\\\\\\\\source\\\\\\\\repos\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter.csproj\" && \"C:/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe\" //t:Build //p:Configuration=Debug //p:Platform=x64 \"C:\\\\\\\\Users\\\\\\\\tcadmin\\\\\\\\source\\\\\\\\repos\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter\\\\\\\\NXCustomViewDxfExporter.csproj\")"
     ]
   }
 }

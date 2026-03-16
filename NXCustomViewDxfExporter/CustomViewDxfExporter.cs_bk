@@ -1,0 +1,1531 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Threading;
+using System.Windows.Forms;
+using NXOpen;
+using NXOpen.Drawings;
+using System.Runtime.InteropServices;
+using NXOpen.UF;
+
+namespace NXCustomViewDxfExporter
+{
+    public class CustomViewDxfExporter
+    {
+        private static Session theSession;
+        private static UFSession theUFSession;
+        private static UI theUI;
+        private static Part workPart;
+        private static ListingWindow lw;
+
+        // 一時defファイルのパス（処理全体で共有し、終了時に削除）
+        private static string tempDefPath;
+
+        // Tempにコピーしたパートファイルのパス（終了時に削除）
+        private static readonly List<string> tempPartCopies = new List<string>();
+
+        // 言語設定
+        private static bool isJapanese;
+        private static Dictionary<string, string> messagesJa;
+        private static Dictionary<string, string> messagesEn;
+
+        // dxfdwg.def 埋め込み内容（DLL経由エクスポート時の設定ズレを防止）
+        private static readonly string EmbeddedDefContent =
+            "ACAD_LAYOUTS_TO_IMPORT =\r\n" +
+            "ACAD_VERSION = 2018\r\n" +
+            "ALTERNATE_SYMBOL_FONT_FOR_EXPORT =Arial Unicode MS\r\n" +
+            "ASPECT_RATIO_CALCULATION_ON_IMPORT =AUTOMATIC_CALCULATION\r\n" +
+            "ASSEMBLY_MAP = ON\r\n" +
+            "AVOID_NX_TEMPLATE_PART_LAYERS =YES\r\n" +
+            "BASE_PART_IN =dwgnull_in.prt\r\n" +
+            "BASE_PART_METER =dwgnull_meter.prt\r\n" +
+            "BASE_PART_MICRON =dwgnull_micron.prt\r\n" +
+            "BASE_PART_MM =dwgnull_mm.prt\r\n" +
+            "BSPLINE_TO_PLINE_CONV_TOL =0.08\r\n" +
+            "CHOOSE_DIRECTION = UG TO DXF\r\n" +
+            "DATA_REDUCTION =no\r\n" +
+            "DSP_MASK =VOLUMINOUS\r\n" +
+            "EXPORT_CURVE_ATTRIBUTES =NO\r\n" +
+            "EXPORT_DIMENSIONS_AS =REAL\r\n" +
+            "EXPORT_DRAWING_USING_CGM =NO\r\n" +
+            "EXPORT_SCALE =1.0\r\n" +
+            "FILL_MODE =OFF\r\n" +
+            "HEAL_GEOMETRY_ON_IMPORT =YES\r\n" +
+            "IMPORT_ACAD_BLOCK_AS =GROUP\r\n" +
+            "IMPORT_ACAD_CURVES_ON_SKETCH =NO\r\n" +
+            "IMPORT_ACAD_LAYOUTS =YES\r\n" +
+            "IMPORT_ACAD_LAYOUTS_TO =IMPORTED_VIEW\r\n" +
+            "IMPORT_ACAD_MODEL_DATA =YES\r\n" +
+            "IMPORT_ACAD_MODEL_DATA_TO =MODELING\r\n" +
+            "IMPORT_ALL_ACAD_LAYOUTS =YES\r\n" +
+            "IMPORT_OBJECTS_FROM_FROZEN_LAYER =NO\r\n" +
+            "IMPORT_OBJECTS_FROM_INVISIBLE_LAYER =NO\r\n" +
+            "IMPORT_UNSELECTED_ACAD_LAYERS =NO\r\n" +
+            "IMPORT_UNSELECTED_ACAD_LAYERS_TO =256\r\n" +
+            "LOG_FILE =\r\n" +
+            "MAX_SPLINE_DEGREE =3\r\n" +
+            "MINIMUM_OBJECT_SIZE_TO_EXCLUDE_ON_IMPORT =0.0\r\n" +
+            "MSG_MASK =VOLUMINOUS\r\n" +
+            "NON_NUMERIC_LAYER_SORTING_CRITERIA =ALPHABETICAL\r\n" +
+            "OPTIMIZE_GEOMETRY =NO\r\n" +
+            "SET_NX_LAYER_NUMBER_FROM_PREFIX =NO\r\n" +
+            "SIMPLIFY_GEOMETRY =NO\r\n" +
+            "SKIP_UNREFERENCED_ACAD_LAYERS =YES\r\n" +
+            "SUPPORT_MTEXT_FORMATTING_ON_IMPORT =NO\r\n" +
+            "SURFU =8\r\n" +
+            "SURFV =8\r\n" +
+            "UGI_ANNOT_MASK =Dimensions,Notes,Labels,ID Symbols,Tolerances,Centerlines,Crosshatching,Draft Aid by Parts,Stand Alone Symbols,Symbol Fonts\r\n" +
+            "UGI_COMP_FAIL = Continue if Load Fails\r\n" +
+            "UGI_COMP_SUB = Do not Allow Substitution\r\n" +
+            "UGI_CURVE_MASK =Points,Lines,Arcs,Conics,B-Curves,Silhouette Curves,Solid Edges on Drawings\r\n" +
+            "UGI_DIM_IMPORT_FLAG =GROUP\r\n" +
+            "UGI_DRAWING_NAMES =\r\n" +
+            "UGI_GDT_EXPORT_AS_BLOCK =YES\r\n" +
+            "UGI_LAYER_MASK =1-256\r\n" +
+            "UGI_LOAD_COMP = Load Components\r\n" +
+            "UGI_LOAD_OPTION = Load From Assem Dir\r\n" +
+            "UGI_LOAD_VER = Load Exact Version\r\n" +
+            "UGI_PROC_ASSEM = Overwrite load_options.def values\r\n" +
+            "UGI_SEARCH_DIRS ={PART_DIR}\r\n" +
+            "UGI_SOLID_EXPORT = FACET\r\n" +
+            "UGI_SOLID_MASK = \r\n" +
+            "UGI_SPLINE_EXPORT = SPLINE\r\n" +
+            "UGI_STRUCT_MASK =Groups,Views,Drawings,Components,Reference Sets\r\n" +
+            "UGI_SURF_MASK = \r\n" +
+            "UGI_USER_DEFINED_VIEWS =\r\n" +
+            "UNITS =Metric\r\n" +
+            "UNSELECTED_ACAD_LAYER_LIST =\r\n" +
+            "VIEW_MODERASE_MODE = YES\r\n" +
+            "WIDTHFACTOR_CALCULATION_ON_EXPORT = AUTOMATIC_CALCULATION\r\n";
+
+        // 標準ビュー名リスト（英語・日本語）
+        private static readonly HashSet<string> StandardViewNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            // 英語
+            "Top", "Front", "Right", "Back", "Bottom", "Left",
+            "Isometric", "Trimetric",
+            // 日本語
+            "上", "正面", "右", "背面", "下", "左",
+            "等角投影", "不等角投影"
+        };
+
+        // シートサイズ定義 (幅mm, 高さmm)
+        private static readonly double[][] SheetSizes =
+        {
+            new double[] { 210.0, 297.0 },   // A4
+            new double[] { 420.0, 297.0 },   // A3
+            new double[] { 594.0, 420.0 },   // A2
+            new double[] { 841.0, 594.0 },   // A1
+            new double[] { 1189.0, 841.0 }   // A0
+        };
+
+        private const double SheetMargin = 10.0; // 各辺のマージン(mm)
+
+        // ================================================================
+        // 言語初期化・メッセージ取得
+        // ================================================================
+
+        private static void InitializeLanguage()
+        {
+            string lang = Environment.GetEnvironmentVariable("UGII_LANG");
+            if (!string.IsNullOrEmpty(lang))
+            {
+                isJapanese = lang.Equals("japanese", StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                isJapanese = System.Globalization.CultureInfo.CurrentUICulture.Name.StartsWith("ja");
+            }
+
+            messagesJa = new Dictionary<string, string>
+            {
+                // ダイアログタイトル
+                { "Error", "エラー" },
+                { "Info", "情報" },
+                // エラーメッセージ
+                { "ErrorNoPartOpen", "パートファイルが開かれていません。" },
+                { "ErrorPartNotSaved", "パートファイルが保存されていません。\n先にパートを保存してから実行してください。" },
+                { "ErrorNoCustomView", "カスタムビューが見つかりません。" },
+                // リスティングウィンドウ
+                { "HeaderTitle", "カスタムビュー DXF エクスポーター" },
+                { "LwPartName", "パート名: {0}" },
+                { "LwPartDir", "パートDir: {0}" },
+                { "LwPartNo", "図面番号: {0}" },
+                { "LwPartRev", "累進: {0}" },
+                { "LwDefFile", "DEF設定ファイル: {0}" },
+                { "LwSearchPathSet", "[検索パス] LoadOptions.SetSearchDirectories 設定済み ({0}件)" },
+                { "LwSearchPathFailed", "[検索パス] LoadOptions設定失敗（続行）: {0}" },
+                { "LwSearchPathAssemSet", "[検索パス] UF_ASSEM.SetSearchDirectories 設定済み" },
+                { "LwSearchPathAssemFailed", "[検索パス] UF_ASSEM設定失敗（続行）: {0}" },
+                { "LwPartCopied", "[検索パス] パートファイルをコピー: {0}" },
+                { "LwPartCopyFailed", "[検索パス] パートコピー失敗（続行）: {0} - {1}" },
+                { "LwOutput", "出力先: {0}" },
+                { "LwTargetViews", "変換対象ビュー: {0} 件" },
+                { "LwDisplaySuppressed", "[バックグラウンド] 画面更新を抑制しました" },
+                { "LwDisplaySuppressFailed", "[バックグラウンド] 画面更新抑制失敗（続行）: {0}" },
+                { "UserStopped", "★ ユーザーにより処理が中止されました。" },
+                { "LwProcessing", "[{0}/{1}] 処理中: {2}" },
+                { "LwSuccess", "  → 成功 ({0:F1}秒)" },
+                { "LwFailed", "  → 失敗 ({0:F1}秒): {1}" },
+                { "LwViewExportFailed", "ビュー '{0}' のエクスポートに失敗: {1}" },
+                { "LwDisplayRestored", "[バックグラウンド] 画面更新を復帰しました" },
+                { "LwDisplayRestoreFailed", "[バックグラウンド] 画面更新復帰失敗: {0}" },
+                { "ResultTitle", "処理結果" },
+                { "LwTotalTime", "合計処理時間: {0:F1}秒" },
+                { "FatalError", "致命的エラー: {0}" },
+                { "UnexpectedError", "予期しないエラーが発生しました:\n{0}" },
+                // 進捗ダイアログ
+                { "ProgressTitle", "DXFエクスポート中..." },
+                { "ProgressMessage", "処理中: {0}（{1}/{2}）" },
+                { "StopButton", "停止" },
+                { "StopRequesting", "停止中..." },
+                // ビュー選択ダイアログ
+                { "ViewSelectTitle", "ビュー選択" },
+                { "ViewSelectAll", "すべて選択" },
+                { "CancelButton", "キャンセル" },
+                { "ViewSelectCancelled", "ビュー選択がキャンセルされました。" },
+                // 完了ダイアログ
+                { "CompleteTitleSuccess", "DXFエクスポート完了" },
+                { "CompleteTitleError", "DXFエクスポート完了（一部エラー）" },
+                { "CompleteMessage", "DXFエクスポートが完了しました" },
+                { "CompleteMessageError", "DXFエクスポートが完了しました（一部エラー）" },
+                { "SuccessCount", "成功: {0} ファイル" },
+                { "FailureCount", "失敗: {0} ファイル" },
+                { "CancelCount", "中断: {0} ファイル（ユーザー停止）" },
+                { "OutputPath", "出力先: {0}" },
+                { "ErrorDetails", "エラー詳細:" },
+                { "OkButton", "OK" },
+            };
+
+            messagesEn = new Dictionary<string, string>
+            {
+                // Dialog titles
+                { "Error", "Error" },
+                { "Info", "Information" },
+                // Error messages
+                { "ErrorNoPartOpen", "No part file is open." },
+                { "ErrorPartNotSaved", "Part file is not saved.\nPlease save the part before running." },
+                { "ErrorNoCustomView", "No custom views found." },
+                // Listing window
+                { "HeaderTitle", "Custom View DXF Exporter" },
+                { "LwPartName", "Part: {0}" },
+                { "LwPartDir", "Part Dir: {0}" },
+                { "LwPartNo", "Part No: {0}" },
+                { "LwPartRev", "Revision: {0}" },
+                { "LwDefFile", "DEF Settings: {0}" },
+                { "LwSearchPathSet", "[Search Path] LoadOptions.SetSearchDirectories configured ({0} entries)" },
+                { "LwSearchPathFailed", "[Search Path] LoadOptions configuration failed (continuing): {0}" },
+                { "LwSearchPathAssemSet", "[Search Path] UF_ASSEM.SetSearchDirectories configured" },
+                { "LwSearchPathAssemFailed", "[Search Path] UF_ASSEM configuration failed (continuing): {0}" },
+                { "LwPartCopied", "[Search Path] Part file copied: {0}" },
+                { "LwPartCopyFailed", "[Search Path] Part copy failed (continuing): {0} - {1}" },
+                { "LwOutput", "Output: {0}" },
+                { "LwTargetViews", "Target views: {0}" },
+                { "LwDisplaySuppressed", "[Background] Display updates suppressed" },
+                { "LwDisplaySuppressFailed", "[Background] Display suppression failed (continuing): {0}" },
+                { "UserStopped", "* Processing stopped by user." },
+                { "LwProcessing", "[{0}/{1}] Processing: {2}" },
+                { "LwSuccess", "  -> Success ({0:F1}s)" },
+                { "LwFailed", "  -> Failed ({0:F1}s): {1}" },
+                { "LwViewExportFailed", "View '{0}' export failed: {1}" },
+                { "LwDisplayRestored", "[Background] Display updates restored" },
+                { "LwDisplayRestoreFailed", "[Background] Display restoration failed: {0}" },
+                { "ResultTitle", "Results" },
+                { "LwTotalTime", "Total time: {0:F1}s" },
+                { "FatalError", "Fatal error: {0}" },
+                { "UnexpectedError", "An unexpected error occurred:\n{0}" },
+                // Progress dialog
+                { "ProgressTitle", "Exporting DXF..." },
+                { "ProgressMessage", "Processing: {0} ({1}/{2})" },
+                { "StopButton", "Stop" },
+                { "StopRequesting", "Stopping..." },
+                // View selection dialog
+                { "ViewSelectTitle", "Select Views" },
+                { "ViewSelectAll", "Select All" },
+                { "CancelButton", "Cancel" },
+                { "ViewSelectCancelled", "View selection cancelled." },
+                // Completion dialog
+                { "CompleteTitleSuccess", "DXF Export Complete" },
+                { "CompleteTitleError", "DXF Export Complete (with errors)" },
+                { "CompleteMessage", "DXF export completed successfully" },
+                { "CompleteMessageError", "DXF export completed with some errors" },
+                { "SuccessCount", "Success: {0} files" },
+                { "FailureCount", "Failed: {0} files" },
+                { "CancelCount", "Cancelled: {0} files (user stopped)" },
+                { "OutputPath", "Output: {0}" },
+                { "ErrorDetails", "Error details:" },
+                { "OkButton", "OK" },
+            };
+        }
+
+        private static string GetMessage(string key)
+        {
+            var dict = isJapanese ? messagesJa : messagesEn;
+            return dict.ContainsKey(key) ? dict[key] : key;
+        }
+
+        private static string GetMessage(string key, params object[] args)
+        {
+            return string.Format(GetMessage(key), args);
+        }
+
+        private static Font GetUIFont(float size, FontStyle style = FontStyle.Regular)
+        {
+            try
+            {
+                Font font = new Font("Yu Gothic UI", size, style);
+                if (font.Name == "Yu Gothic UI") return font;
+                font.Dispose();
+            }
+            catch { }
+            return new Font("Segoe UI", size, style);
+        }
+
+        // ================================================================
+        // メインエントリポイント
+        // ================================================================
+
+        public static void Main(string[] args)
+        {
+            theSession = Session.GetSession();
+            theUFSession = UFSession.GetUFSession();
+            theUI = UI.GetUI();
+            lw = theSession.ListingWindow;
+            lw.Open();
+
+            InitializeLanguage();
+
+            Stopwatch totalSw = Stopwatch.StartNew();
+
+            // CGM環境変数の元の値を退避
+            string originalCgmEnv = Environment.GetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE");
+
+            // 二重呼び出し防止フラグ
+            bool displaySuppressed = false;
+
+            int successCount = 0;
+            int failCount = 0;
+            int cancelCount = 0;
+            List<string> errorDetails = new List<string>();
+            string outputFolder = null;
+
+            ProgressForm progressForm = null;
+            Thread progressThread = null;
+
+            try
+            {
+                // 1. 作業パートの確認
+                workPart = theSession.Parts.Work;
+                if (workPart == null)
+                {
+                    theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
+                        GetMessage("ErrorNoPartOpen"));
+                    return;
+                }
+
+                // パートが保存済み（ディスク上に存在）であることを確認
+                if (string.IsNullOrEmpty(workPart.FullPath))
+                {
+                    theUI.NXMessageBox.Show(GetMessage("Error"), NXMessageBox.DialogType.Error,
+                        GetMessage("ErrorPartNotSaved"));
+                    return;
+                }
+
+                // CGMダイアログ抑制（処理開始前に設定）
+                SuppressCgmDialog();
+
+                // パート名（拡張子なし）とディレクトリを取得
+                string partName = Path.GetFileNameWithoutExtension(workPart.FullPath);
+                string partDir = Path.GetDirectoryName(workPart.FullPath);
+                lw.WriteLine("========================================");
+                lw.WriteLine("  " + GetMessage("HeaderTitle"));
+                lw.WriteLine("========================================");
+                lw.WriteLine(GetMessage("LwPartName", partName));
+                lw.WriteLine(GetMessage("LwPartDir", partDir));
+
+                // 2. パート属性からDB_PART_NO, DB_PART_REVを取得
+                string partNo;
+                string partRev;
+                GetPartAttributes(out partNo, out partRev);
+                lw.WriteLine(GetMessage("LwPartNo", partNo));
+                lw.WriteLine(GetMessage("LwPartRev", partRev));
+
+                // 3. パートファイル検索パスの設定（Failed to retrieve file 対策）
+                SetupPartSearchPaths(partDir);
+
+                // 4. dxfdwg.def 一時ファイルの生成（{PART_DIR}をパートディレクトリに置換）
+                string defContent = EmbeddedDefContent.Replace("{PART_DIR}", partDir);
+                tempDefPath = Path.Combine(Path.GetTempPath(), "nxdxf_export_settings.def");
+                File.WriteAllText(tempDefPath, defContent);
+                lw.WriteLine(GetMessage("LwDefFile", tempDefPath));
+
+                // 5. パートファイルをTempディレクトリにコピー（トランスレータが確実に参照可能にする）
+                CopyPartFilesToTemp(workPart.FullPath);
+
+                // 6. 出力フォルダ（Picturesフォルダに固定）
+                outputFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+                Directory.CreateDirectory(outputFolder);
+                lw.WriteLine(GetMessage("LwOutput", outputFolder));
+
+                // 7. カスタムビューの取得
+                List<ModelingView> customViews = GetCustomViews();
+                if (customViews.Count == 0)
+                {
+                    lw.WriteLine(GetMessage("ErrorNoCustomView"));
+                    theUI.NXMessageBox.Show(GetMessage("Info"), NXMessageBox.DialogType.Information,
+                        GetMessage("ErrorNoCustomView"));
+                    return;
+                }
+
+                lw.WriteLine("----------------------------------------");
+                lw.WriteLine(GetMessage("LwTargetViews", customViews.Count));
+                for (int i = 0; i < customViews.Count; i++)
+                {
+                    lw.WriteLine(string.Format("  {0}. {1}", i + 1, customViews[i].Name));
+                }
+                lw.WriteLine("----------------------------------------");
+
+                // 8. ビュー選択ダイアログ
+                List<ModelingView> selectedViews;
+                using (var viewSelectForm = new ViewSelectionForm(customViews))
+                {
+                    if (viewSelectForm.ShowDialog() != DialogResult.OK)
+                    {
+                        lw.WriteLine(GetMessage("ViewSelectCancelled"));
+                        return;
+                    }
+                    selectedViews = new List<ModelingView>();
+                    foreach (int idx in viewSelectForm.SelectedIndices)
+                    {
+                        selectedViews.Add(customViews[idx]);
+                    }
+                }
+
+                if (selectedViews.Count == 0)
+                {
+                    lw.WriteLine(GetMessage("ViewSelectCancelled"));
+                    return;
+                }
+
+                // 9. 製図アプリケーションに切り替え（ループ外で1回だけ実行）
+                theSession.ApplicationSwitchImmediate("UG_APP_DRAFTING");
+
+                // 10. 画面更新を抑制
+                try
+                {
+                    theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_SUPPRESS_DISPLAY);
+                    displaySuppressed = true;
+                    lw.WriteLine(GetMessage("LwDisplaySuppressed"));
+                }
+                catch (Exception ex)
+                {
+                    lw.WriteLine(GetMessage("LwDisplaySuppressFailed", ex.Message));
+                }
+
+                // 12. 進捗ダイアログを専用STAスレッドで表示（NXOpen APIブロック中も操作可能）
+                ManualResetEvent formReady = new ManualResetEvent(false);
+                progressThread = new Thread(() =>
+                {
+                    progressForm = new ProgressForm(selectedViews.Count);
+                    progressForm.HandleCreated += (s, e) => formReady.Set();
+                    Application.Run(progressForm);
+                    progressForm.Dispose();
+                    progressForm = null;
+                });
+                progressThread.SetApartmentState(ApartmentState.STA);
+                progressThread.IsBackground = true;
+                progressThread.Start();
+                formReady.WaitOne(5000);
+
+                // ★ v2.0.4: ループ中は図面シートを削除しない。全エクスポート完了後に一括削除。
+                List<DrawingSheet> sheetsToCleanup = new List<DrawingSheet>();
+                List<string> expectedOutputFiles = new List<string>();
+
+                // 13. カスタムビューごとのループ処理
+                for (int i = 0; i < selectedViews.Count; i++)
+                {
+                    // 中断チェック
+                    if (progressForm != null && progressForm.StopRequested)
+                    {
+                        cancelCount = selectedViews.Count - i;
+                        break;
+                    }
+
+                    ModelingView view = selectedViews[i];
+
+                    // 進捗更新
+                    if (progressForm != null)
+                        progressForm.UpdateProgress(view.Name, i + 1, selectedViews.Count);
+
+                    Stopwatch viewSw = Stopwatch.StartNew();
+                    DrawingSheet createdSheet = null;
+                    string outputFilePath = null;
+                    try
+                    {
+                        ExportViewAsDxf(view, partNo, partRev, outputFolder, out createdSheet, out outputFilePath);
+                        viewSw.Stop();
+                        successCount++;
+                        if (!string.IsNullOrEmpty(outputFilePath))
+                            expectedOutputFiles.Add(outputFilePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        viewSw.Stop();
+                        failCount++;
+                        string errorMsg = string.Format("{0}: {1}", view.Name, ex.Message);
+                        errorDetails.Add(errorMsg);
+                    }
+                    // シートは削除せずクリーンアップリストに追加（エラー時も含む）
+                    if (createdSheet != null)
+                        sheetsToCleanup.Add(createdSheet);
+                }
+
+                // === 全ビューのエクスポート完了後、DXFファイル出力を待機 ===
+                foreach (string expectedFile in expectedOutputFiles)
+                {
+                    WaitForDxfFileReady(expectedFile);
+                }
+                // バックグラウンドスレッドの完全終了を待つ安全マージン
+                Thread.Sleep(5000);
+
+                // 全DXFファイル出力完了後に、図面シートを一括削除
+                foreach (var cleanupSheet in sheetsToCleanup)
+                {
+                    try
+                    {
+                        theUFSession.Draw.DeleteDrawing(cleanupSheet.Tag);
+                    }
+                    catch { }
+                }
+                sheetsToCleanup.Clear();
+
+                // === ループ終了後のクリーンアップ ===
+
+                bool userStopped = (cancelCount > 0);
+
+                // Step 1: 進捗ダイアログを閉じる（STAスレッドのApplication.Runを終了）
+                if (progressForm != null)
+                {
+                    try { progressForm.ForceClose(); } catch { }
+                    progressForm = null;
+                }
+                // スレッド完了を待つ（DLLアンロード時のクラッシュ防止）
+                if (progressThread != null && progressThread.IsAlive)
+                {
+                    progressThread.Join(2000);
+                }
+
+                // 画面更新を復帰
+                if (displaySuppressed)
+                {
+                    try
+                    {
+                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                    }
+                    catch { }
+                    displaySuppressed = false;
+                }
+
+                // モデリングアプリケーションに戻る
+                try { theSession.ApplicationSwitchImmediate("UG_APP_MODELING"); }
+                catch { }
+
+                // リスティングウィンドウに結果を出力
+                totalSw.Stop();
+                try
+                {
+                    lw.Open();
+                    lw.WriteLine("\n========================================");
+                    lw.WriteLine("  " + GetMessage("ResultTitle"));
+                    lw.WriteLine("========================================");
+                    lw.WriteLine(GetMessage("SuccessCount", successCount));
+                    if (failCount > 0)
+                        lw.WriteLine(GetMessage("FailureCount", failCount));
+                    if (cancelCount > 0)
+                        lw.WriteLine(GetMessage("CancelCount", cancelCount));
+                    lw.WriteLine(GetMessage("LwTotalTime", totalSw.Elapsed.TotalSeconds));
+                    lw.WriteLine("========================================");
+                }
+                catch { }
+
+                // 完了ダイアログを表示（NX内部状態安定化のため少し待機）
+                Thread.Sleep(500);
+                using (var completionForm = new CompletionForm(
+                    successCount, failCount, cancelCount, errorDetails, outputFolder))
+                {
+                    completionForm.ShowDialog();
+                }
+            }
+            catch (Exception ex)
+            {
+                // 全ての例外をキャッチ（NXに伝播させない）
+                try
+                {
+                    if (progressForm != null)
+                    {
+                        progressForm.ForceClose();
+                        progressForm = null;
+                    }
+                    if (progressThread != null && progressThread.IsAlive)
+                        progressThread.Join(2000);
+                }
+                catch { }
+
+                try
+                {
+                    MessageBox.Show(
+                        GetMessage("UnexpectedError", ex.Message),
+                        GetMessage("Error"),
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                catch { }
+            }
+            finally
+            {
+                // 確実に復帰
+
+                try
+                {
+                    if (progressForm != null)
+                    {
+                        progressForm.ForceClose();
+                        progressForm = null;
+                    }
+                    if (progressThread != null && progressThread.IsAlive)
+                        progressThread.Join(2000);
+                }
+                catch { }
+
+                // 画面更新の抑制を解除
+                try
+                {
+                    if (displaySuppressed)
+                    {
+                        theUFSession.Disp.SetDisplay(NXOpen.UF.UFConstants.UF_DISP_UNSUPPRESS_DISPLAY);
+                    }
+                }
+                catch { }
+
+                // モデリング環境に戻す（まだ戻っていない場合）
+                try { theSession.ApplicationSwitchImmediate("UG_APP_MODELING"); }
+                catch { }
+
+                // CGM環境変数を元に戻す
+                try
+                {
+                    Environment.SetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE", originalCgmEnv);
+                }
+                catch { }
+
+                // 一時defファイルを削除
+                try
+                {
+                    if (tempDefPath != null && File.Exists(tempDefPath))
+                        File.Delete(tempDefPath);
+                }
+                catch { }
+
+                // Tempにコピーしたパートファイルを削除
+                CleanupTempPartCopies();
+            }
+        }
+
+        // ================================================================
+        // パートファイル検索パスの設定
+        // ================================================================
+
+        private static void SetupPartSearchPaths(string partDir)
+        {
+            // 対策1: 既存の検索ディレクトリにパートDirを追加（上書きではなく追加）
+            try
+            {
+                string[] existingDirs;
+                bool[] existingFlags;
+                theSession.Parts.LoadOptions.GetSearchDirectories(out existingDirs, out existingFlags);
+
+                List<string> allDirs = new List<string>();
+                List<bool> allFlags = new List<bool>();
+
+                // パートDirを先頭に追加（優先度最高）
+                allDirs.Add(partDir);
+                allFlags.Add(true); // サブディレクトリも検索
+
+                // 既存のディレクトリを追加
+                if (existingDirs != null)
+                {
+                    for (int i = 0; i < existingDirs.Length; i++)
+                    {
+                        if (!string.Equals(existingDirs[i], partDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            allDirs.Add(existingDirs[i]);
+                            allFlags.Add(existingFlags[i]);
+                        }
+                    }
+                }
+
+                theSession.Parts.LoadOptions.SetSearchDirectories(
+                    allDirs.ToArray(), allFlags.ToArray());
+                lw.WriteLine(GetMessage("LwSearchPathSet", allDirs.Count));
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine(GetMessage("LwSearchPathFailed", ex.Message));
+            }
+
+            // 対策2: UF_ASSEMレベルで検索ディレクトリを設定
+            try
+            {
+                theUFSession.Assem.SetSearchDirectories(
+                    1,
+                    new string[] { partDir },
+                    new bool[] { true });
+                lw.WriteLine(GetMessage("LwSearchPathAssemSet"));
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine(GetMessage("LwSearchPathAssemFailed", ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// パートファイルとその関連ファイルをTempディレクトリにコピー。
+        /// </summary>
+        private static void CopyPartFilesToTemp(string partFullPath)
+        {
+            string partFileName = Path.GetFileName(partFullPath);
+            string tempDir = Path.GetTempPath();
+
+            // %TEMP% にコピー
+            CopySinglePartToDir(partFullPath, tempDir, partFileName);
+
+            // %TEMP%\2\ にコピー（DXFトランスレータが使うサブディレクトリ）
+            string tempDir2 = Path.Combine(tempDir, "2");
+            if (Directory.Exists(tempDir2))
+            {
+                CopySinglePartToDir(partFullPath, tempDir2, partFileName);
+            }
+        }
+
+        private static void CopySinglePartToDir(string srcPath, string destDir, string fileName)
+        {
+            try
+            {
+                string destPath = Path.Combine(destDir, fileName);
+                File.Copy(srcPath, destPath, true);
+                tempPartCopies.Add(destPath);
+                lw.WriteLine(GetMessage("LwPartCopied", destPath));
+            }
+            catch (Exception ex)
+            {
+                lw.WriteLine(GetMessage("LwPartCopyFailed", destDir, ex.Message));
+            }
+        }
+
+        private static void CleanupTempPartCopies()
+        {
+            foreach (string path in tempPartCopies)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                }
+                catch { }
+            }
+            tempPartCopies.Clear();
+        }
+
+        // ================================================================
+        // パート属性取得
+        // ================================================================
+
+        private static void GetPartAttributes(out string partNo, out string partRev)
+        {
+            partNo = "";
+            partRev = "";
+
+            try
+            {
+                NXObject.AttributeInformation[] attrs = workPart.GetUserAttributes();
+                foreach (var attr in attrs)
+                {
+                    if (attr.Title.Equals("DB_PART_NO", StringComparison.OrdinalIgnoreCase))
+                        partNo = attr.StringValue != null ? attr.StringValue.Trim() : "";
+                    if (attr.Title.Equals("DB_PART_REV", StringComparison.OrdinalIgnoreCase))
+                        partRev = attr.StringValue != null ? attr.StringValue.Trim() : "";
+                }
+            }
+            catch { }
+
+            // DB_PART_NO が空の場合、Leaf名を代用
+            if (string.IsNullOrEmpty(partNo))
+            {
+                try { partNo = workPart.Leaf; }
+                catch { partNo = Path.GetFileNameWithoutExtension(workPart.FullPath); }
+            }
+        }
+
+        // ================================================================
+        // ファイル名サニタイズ・重複回避
+        // ================================================================
+
+        private static string SanitizeFileName(string name)
+        {
+            char[] invalid = Path.GetInvalidFileNameChars();
+            string result = string.Join("_", name.Split(invalid));
+            while (result.Contains("__"))
+                result = result.Replace("__", "_");
+            return result.Trim('_');
+        }
+
+        private static string GetUniqueFilePath(string folder, string baseName, string extension)
+        {
+            string filePath = Path.Combine(folder, baseName + extension);
+            if (!File.Exists(filePath))
+                return filePath;
+
+            int counter = 1;
+            while (true)
+            {
+                filePath = Path.Combine(folder, string.Format("{0}_({1}){2}", baseName, counter, extension));
+                if (!File.Exists(filePath))
+                    return filePath;
+                counter++;
+            }
+        }
+
+        // ================================================================
+        // カスタムビューのフィルタリング
+        // ================================================================
+
+        private static List<ModelingView> GetCustomViews()
+        {
+            List<ModelingView> customViews = new List<ModelingView>();
+            ModelingViewCollection views = workPart.ModelingViews;
+
+            foreach (ModelingView view in views)
+            {
+                if (!StandardViewNames.Contains(view.Name))
+                {
+                    customViews.Add(view);
+                }
+            }
+
+            return customViews;
+        }
+
+        // ================================================================
+        // 個別ビューのエクスポート処理
+        // ================================================================
+
+        private static void ExportViewAsDxf(ModelingView view, string partNo, string partRev, string outputFolder,
+            out DrawingSheet createdSheet, out string outputFilePath)
+        {
+            createdSheet = null;
+            outputFilePath = null;
+
+            // ビューのバウンディングボックスからシートサイズを決定
+            double viewWidth;
+            double viewHeight;
+            GetViewBounds(out viewWidth, out viewHeight);
+
+            double sheetWidth;
+            double sheetHeight;
+            SelectSheetSize(viewWidth, viewHeight, out sheetWidth, out sheetHeight);
+
+            // b. 図面シートの作成 (DraftingDrawingSheetBuilder使用 - ジャーナル準拠)
+            NXOpen.Drawings.DraftingDrawingSheet nullDraftingSheet = null;
+            var sheetBuilder = workPart.DraftingDrawingSheets.CreateDraftingDrawingSheetBuilder(nullDraftingSheet);
+            sheetBuilder.AutoStartViewCreation = false;
+            sheetBuilder.Option = DrawingSheetBuilder.SheetOption.CustomSize;
+            sheetBuilder.Height = sheetHeight;
+            sheetBuilder.Length = sheetWidth;
+            sheetBuilder.ScaleNumerator = 1.0;
+            sheetBuilder.ScaleDenominator = 1.0;
+            sheetBuilder.Units = DrawingSheetBuilder.SheetUnits.Metric;
+            sheetBuilder.ProjectionAngle = DrawingSheetBuilder.SheetProjectionAngle.Third;
+
+            NXObject sheetObj = sheetBuilder.Commit();
+            DrawingSheet sheet = (DrawingSheet)sheetObj;
+            sheetBuilder.Destroy();
+
+            // ★ シートを即座にout paramに設定（例外時にも呼出元でクリーンアップ可能）
+            createdSheet = sheet;
+
+            // ジャーナル準拠: テンプレートインスタンス化完了を通知
+            workPart.Drafting.SetTemplateInstantiationIsComplete(true);
+
+            // シートを開く
+            sheet.Open();
+
+            // c. ベースビューの配置（ジャーナル準拠）
+            workPart.DraftingManager.DrawingsFreezeOutOfDateComputation();
+
+            NXOpen.Drawings.BaseView nullBaseView = null;
+            BaseViewBuilder baseViewBuilder = workPart.DraftingViews.CreateBaseViewBuilder(nullBaseView);
+
+            baseViewBuilder.Placement.Associative = true;
+
+            // カスタムビューを選択
+            baseViewBuilder.SelectModelView.SelectedView = view;
+
+            baseViewBuilder.SecondaryComponents.ObjectType =
+                NXOpen.Drawings.DraftingComponentSelectionBuilder.Geometry.PrimaryGeometry;
+
+            // ★重要: PartNameに元パートのフルパスを明示的に設定（参照解決に必要）
+            baseViewBuilder.Style.ViewStyleBase.Part = workPart;
+            baseViewBuilder.Style.ViewStyleBase.PartName = workPart.FullPath;
+
+            // ジャーナル準拠: PartName設定後にビューを再選択
+            baseViewBuilder.SelectModelView.SelectedView = view;
+
+            // ビューがシートに収まるようスケール調整
+            double availableWidth = sheetWidth - (SheetMargin * 2);
+            double availableHeight = sheetHeight - (SheetMargin * 2);
+            baseViewBuilder.Scale.Denominator = 1.0;
+            baseViewBuilder.Scale.Numerator = 1.0;
+            if (viewWidth > 0 && viewHeight > 0)
+            {
+                double scaleX = availableWidth / viewWidth;
+                double scaleY = availableHeight / viewHeight;
+                double scale = Math.Min(scaleX, scaleY);
+                if (scale < 1.0)
+                {
+                    baseViewBuilder.Scale.Numerator = scale;
+                }
+            }
+
+            // 配置位置（シート中央）
+            Point3d viewOrigin = new Point3d(sheetWidth / 2.0, sheetHeight / 2.0, 0.0);
+            baseViewBuilder.Placement.Placement.SetValue(null, workPart.Views.WorkView, viewOrigin);
+
+            NXObject baseViewObj = baseViewBuilder.Commit();
+
+            workPart.DraftingManager.DrawingsUnfreezeOutOfDateComputation();
+            baseViewBuilder.Destroy();
+
+            // d. DXFエクスポート（ジャーナル準拠の順序）
+            string baseName = string.Format("{0}_{1}_{2}", partNo, partRev, view.Name);
+            baseName = SanitizeFileName(baseName);
+            string dxfFilePath = GetUniqueFilePath(outputFolder, baseName, ".dxf");
+            outputFilePath = dxfFilePath;
+
+            DxfdwgCreator dxfCreator = theSession.DexManager.CreateDxfdwgCreator();
+
+            // --- SettingsFileより前の初期設定（ジャーナル順序）---
+            dxfCreator.ExportData = DxfdwgCreator.ExportDataOption.Drawing;
+            dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2004;
+            dxfCreator.ViewEditMode = true;
+            dxfCreator.FlattenAssembly = true;
+            dxfCreator.ExportScaleValue = 1.0;
+
+            // --- dxfdwg.def設定ファイルの読み込み ---
+            dxfCreator.SettingsFile = tempDefPath;
+
+            // --- SettingsFile読み込み後の設定（defの値を上書き）---
+            dxfCreator.OutputTo = DxfdwgCreator.OutputToOption.Drafting;
+            dxfCreator.ObjectTypes.Curves = true;
+            dxfCreator.ObjectTypes.Annotations = true;
+            dxfCreator.ObjectTypes.Structures = true;
+            dxfCreator.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2018;
+            dxfCreator.FlattenAssembly = false;
+
+            // ★重要: InputFileに元パートのフルパスを設定（参照解決に必要）
+            dxfCreator.InputFile = workPart.FullPath;
+
+            dxfCreator.OutputFile = dxfFilePath;
+
+            // --- Commit直前の最終設定 ---
+            dxfCreator.WidthFactorMode = DxfdwgCreator.WidthfactorMethodOptions.AutomaticCalculation;
+            dxfCreator.LayerMask = "1-256";
+            dxfCreator.DrawingList = @"""Sheet 1""";
+            dxfCreator.ProcessHoldFlag = true;
+
+            dxfCreator.Commit();
+            dxfCreator.Destroy();
+            dxfCreator = null;
+
+            // ★ v2.0.4: ここではDXFファイル待機もシート削除もしない
+            // 呼出元で全エクスポート完了後に一括処理する
+        }
+
+        /// <summary>
+        /// DXFファイルの出力完了を待機する。
+        /// ファイルの存在確認後、書き込みロックが解放されるまで待つ。
+        /// </summary>
+        private static void WaitForDxfFileReady(string outputPath)
+        {
+            int waitMs = 0;
+            int maxWaitMs = 30000; // 最大30秒
+            while (!File.Exists(outputPath) && waitMs < maxWaitMs)
+            {
+                Thread.Sleep(500);
+                waitMs += 500;
+            }
+
+            // ファイルが書き込み中でないか確認（ロックが解放されるまで待つ）
+            if (File.Exists(outputPath))
+            {
+                for (int retry = 0; retry < 20; retry++)
+                {
+                    try
+                    {
+                        using (var fs = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                        {
+                            break; // ファイルのロックが解放された = 書き込み完了
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        Thread.Sleep(500);
+                    }
+                }
+            }
+        }
+
+        // ================================================================
+        // CGMダイアログ抑制
+        // ================================================================
+
+        private static void SuppressCgmDialog()
+        {
+            Environment.SetEnvironmentVariable("UGII_CGM_FITS_FILE_SAVE", "0");
+
+            try
+            {
+                workPart.SaveOptions.DrawingCgmData = false;
+            }
+            catch { }
+        }
+
+        // ================================================================
+        // ビューサイズ・シートサイズ
+        // ================================================================
+
+        private static void GetViewBounds(out double width, out double height)
+        {
+            try
+            {
+                double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
+                double maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
+                bool found = false;
+
+                foreach (Body body in workPart.Bodies)
+                {
+                    double[] minCorner = new double[3];
+                    double[,] directions = new double[3, 3];
+                    double[] distances = new double[3];
+                    theUFSession.Modl.AskBoundingBoxExact(body.Tag,
+                        Tag.Null, minCorner, directions, distances);
+
+                    double bodyMaxX = minCorner[0] + distances[0];
+                    double bodyMaxY = minCorner[1] + distances[1];
+                    double bodyMaxZ = minCorner[2] + distances[2];
+
+                    if (minCorner[0] < minX) minX = minCorner[0];
+                    if (minCorner[1] < minY) minY = minCorner[1];
+                    if (minCorner[2] < minZ) minZ = minCorner[2];
+                    if (bodyMaxX > maxX) maxX = bodyMaxX;
+                    if (bodyMaxY > maxY) maxY = bodyMaxY;
+                    if (bodyMaxZ > maxZ) maxZ = bodyMaxZ;
+                    found = true;
+                }
+
+                if (found)
+                {
+                    double dx = maxX - minX;
+                    double dy = maxY - minY;
+                    double dz = maxZ - minZ;
+
+                    double[] dims = new double[] { dx, dy, dz };
+                    Array.Sort(dims);
+                    width = dims[2];
+                    height = dims[1];
+
+                    if (width <= 0) width = 200.0;
+                    if (height <= 0) height = 200.0;
+                }
+                else
+                {
+                    width = 200.0;
+                    height = 200.0;
+                }
+            }
+            catch
+            {
+                width = 200.0;
+                height = 200.0;
+            }
+        }
+
+        private static void SelectSheetSize(double viewWidth, double viewHeight, out double sheetWidth, out double sheetHeight)
+        {
+            double requiredWidth = viewWidth + (SheetMargin * 2);
+            double requiredHeight = viewHeight + (SheetMargin * 2);
+
+            foreach (double[] size in SheetSizes)
+            {
+                double w = size[0];
+                double h = size[1];
+
+                if ((w >= requiredWidth && h >= requiredHeight) ||
+                    (h >= requiredWidth && w >= requiredHeight))
+                {
+                    if (w >= requiredWidth && h >= requiredHeight)
+                    {
+                        sheetWidth = w;
+                        sheetHeight = h;
+                    }
+                    else
+                    {
+                        sheetWidth = h;
+                        sheetHeight = w;
+                    }
+                    return;
+                }
+            }
+
+            sheetWidth = SheetSizes[SheetSizes.Length - 1][0];
+            sheetHeight = SheetSizes[SheetSizes.Length - 1][1];
+        }
+
+        public static int GetUnloadOption(string dummy)
+        {
+            return (int)Session.LibraryUnloadOption.Immediately;
+        }
+
+        // ================================================================
+        // 進捗ダイアログ（ProgressForm）
+        // ================================================================
+
+        private class ProgressForm : Form
+        {
+            // Win32 API: ダイアログを確実に最前面に維持する
+            [DllImport("user32.dll")]
+            private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+                int X, int Y, int cx, int cy, uint uFlags);
+
+            private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+            private const uint SWP_NOMOVE = 0x0002;
+            private const uint SWP_NOSIZE = 0x0001;
+            private const uint SWP_NOACTIVATE = 0x0010;
+
+            private Label labelProgress;
+            private ProgressBar progressBar;
+            private Label labelPercent;
+            private Button btnStop;
+            private System.Windows.Forms.Timer foregroundTimer;
+            private volatile bool _stopRequested;
+            private bool _allowClose;
+
+            public bool StopRequested => _stopRequested;
+
+            public ProgressForm(int totalViews)
+            {
+                _stopRequested = false;
+                _allowClose = false;
+
+                this.Text = GetMessage("ProgressTitle");
+                this.Width = 400;
+                this.Height = 200;
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.StartPosition = FormStartPosition.CenterScreen;
+                this.TopMost = true;
+                this.ShowInTaskbar = true;
+                this.Font = GetUIFont(9f);
+
+                // ×ボタンの無効化（ForceClose以外では閉じさせない）
+                this.FormClosing += (s, e) =>
+                {
+                    if (!_allowClose && e.CloseReason == CloseReason.UserClosing)
+                        e.Cancel = true;
+                };
+
+                labelProgress = new Label();
+                labelProgress.Text = GetMessage("ProgressMessage", "...", 0, totalViews);
+                labelProgress.Location = new System.Drawing.Point(20, 20);
+                labelProgress.Size = new System.Drawing.Size(350, 25);
+                labelProgress.Font = GetUIFont(10f);
+                this.Controls.Add(labelProgress);
+
+                progressBar = new ProgressBar();
+                progressBar.Location = new System.Drawing.Point(20, 55);
+                progressBar.Size = new System.Drawing.Size(280, 25);
+                progressBar.Minimum = 0;
+                progressBar.Maximum = totalViews;
+                progressBar.Value = 0;
+                this.Controls.Add(progressBar);
+
+                labelPercent = new Label();
+                labelPercent.Text = "0%";
+                labelPercent.Location = new System.Drawing.Point(310, 58);
+                labelPercent.Size = new System.Drawing.Size(50, 25);
+                labelPercent.Font = GetUIFont(10f);
+                this.Controls.Add(labelPercent);
+
+                btnStop = new Button();
+                btnStop.Text = GetMessage("StopButton");
+                btnStop.Location = new System.Drawing.Point(140, 100);
+                btnStop.Size = new System.Drawing.Size(120, 40);
+                btnStop.BackColor = Color.FromArgb(220, 53, 69);
+                btnStop.ForeColor = Color.White;
+                btnStop.FlatStyle = FlatStyle.Flat;
+                btnStop.Font = GetUIFont(10f, FontStyle.Bold);
+                btnStop.Click += btnStop_Click;
+                this.Controls.Add(btnStop);
+
+                // Timer: 500ms間隔でダイアログを最前面に強制（NXがフォーカスを奪っても維持）
+                foregroundTimer = new System.Windows.Forms.Timer();
+                foregroundTimer.Interval = 500;
+                foregroundTimer.Tick += (s2, e2) =>
+                {
+                    if (this.Visible && !this.IsDisposed)
+                    {
+                        SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
+                };
+                foregroundTimer.Start();
+            }
+
+            private void btnStop_Click(object sender, EventArgs e)
+            {
+                _stopRequested = true;
+                btnStop.Enabled = false;
+                btnStop.Text = GetMessage("StopRequesting");
+            }
+
+            public void UpdateProgress(string viewName, int current, int total)
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() => UpdateProgress(viewName, current, total)));
+                    return;
+                }
+                labelProgress.Text = GetMessage("ProgressMessage", viewName, current, total);
+                progressBar.Maximum = total;
+                progressBar.Value = current;
+                labelPercent.Text = string.Format("{0}%", (int)((double)current / total * 100));
+            }
+
+            /// <summary>
+            /// 別スレッドから安全にフォームを閉じる。Application.Runを終了させる。
+            /// </summary>
+            public void ForceClose()
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(ForceClose));
+                    return;
+                }
+                if (foregroundTimer != null)
+                {
+                    foregroundTimer.Stop();
+                    foregroundTimer.Dispose();
+                    foregroundTimer = null;
+                }
+                _allowClose = true;
+                Close();
+            }
+        }
+
+        // ================================================================
+        // 完了ダイアログ（CompletionForm）
+        // ================================================================
+
+        private class CompletionForm : Form
+        {
+            public CompletionForm(int successCount, int failCount, int cancelCount,
+                List<string> errors, string outputPath)
+            {
+                bool hasErrors = failCount > 0;
+
+                this.Text = hasErrors ? GetMessage("CompleteTitleError") : GetMessage("CompleteTitleSuccess");
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.StartPosition = FormStartPosition.CenterScreen;
+                this.TopMost = true;
+                this.ShowInTaskbar = true;
+                this.Font = GetUIFont(9f);
+
+                int y = 20;
+
+                // ステータスアイコン + メッセージ
+                Label labelStatus = new Label();
+                if (hasErrors)
+                {
+                    labelStatus.Text = "\u26A0 " + GetMessage("CompleteMessageError");
+                }
+                else
+                {
+                    labelStatus.Text = "\u2713 " + GetMessage("CompleteMessage");
+                }
+                labelStatus.Location = new System.Drawing.Point(20, y);
+                labelStatus.Size = new System.Drawing.Size(400, 30);
+                labelStatus.Font = GetUIFont(11f, FontStyle.Bold);
+                this.Controls.Add(labelStatus);
+                y += 40;
+
+                // 成功数
+                Label labelSuccess = new Label();
+                labelSuccess.Text = GetMessage("SuccessCount", successCount);
+                labelSuccess.Location = new System.Drawing.Point(30, y);
+                labelSuccess.Size = new System.Drawing.Size(380, 22);
+                labelSuccess.Font = GetUIFont(10f);
+                this.Controls.Add(labelSuccess);
+                y += 25;
+
+                // 失敗数
+                if (failCount > 0)
+                {
+                    Label labelFail = new Label();
+                    labelFail.Text = GetMessage("FailureCount", failCount);
+                    labelFail.Location = new System.Drawing.Point(30, y);
+                    labelFail.Size = new System.Drawing.Size(380, 22);
+                    labelFail.Font = GetUIFont(10f);
+                    this.Controls.Add(labelFail);
+                    y += 25;
+                }
+
+                // 中断数
+                if (cancelCount > 0)
+                {
+                    Label labelCancel = new Label();
+                    labelCancel.Text = GetMessage("CancelCount", cancelCount);
+                    labelCancel.Location = new System.Drawing.Point(30, y);
+                    labelCancel.Size = new System.Drawing.Size(380, 22);
+                    labelCancel.Font = GetUIFont(10f);
+                    this.Controls.Add(labelCancel);
+                    y += 25;
+                }
+
+                // 出力先パス
+                Label labelOutput = new Label();
+                labelOutput.Text = GetMessage("OutputPath", outputPath);
+                labelOutput.Location = new System.Drawing.Point(30, y);
+                labelOutput.Size = new System.Drawing.Size(380, 22);
+                labelOutput.Font = GetUIFont(9f);
+                this.Controls.Add(labelOutput);
+                y += 30;
+
+                // エラー詳細
+                if (errors != null && errors.Count > 0)
+                {
+                    Label labelErrorHeader = new Label();
+                    labelErrorHeader.Text = GetMessage("ErrorDetails");
+                    labelErrorHeader.Location = new System.Drawing.Point(30, y);
+                    labelErrorHeader.Size = new System.Drawing.Size(380, 22);
+                    labelErrorHeader.Font = GetUIFont(9f, FontStyle.Bold);
+                    this.Controls.Add(labelErrorHeader);
+                    y += 25;
+
+                    foreach (string error in errors)
+                    {
+                        Label labelError = new Label();
+                        labelError.Text = "  " + error;
+                        labelError.Location = new System.Drawing.Point(30, y);
+                        labelError.Size = new System.Drawing.Size(380, 40);
+                        labelError.Font = GetUIFont(9f);
+                        this.Controls.Add(labelError);
+                        y += 40;
+                    }
+                }
+
+                y += 10;
+
+                // OKボタン
+                Button btnOk = new Button();
+                btnOk.Text = GetMessage("OkButton");
+                btnOk.Location = new System.Drawing.Point(170, y);
+                btnOk.Size = new System.Drawing.Size(100, 35);
+                btnOk.Font = GetUIFont(10f);
+                btnOk.Click += (s, e) =>
+                {
+                    this.DialogResult = DialogResult.OK;
+                    this.Close();
+                };
+                this.Controls.Add(btnOk);
+                this.AcceptButton = btnOk;
+
+                y += 55;
+
+                this.ClientSize = new System.Drawing.Size(430, y);
+            }
+        }
+
+        // ================================================================
+        // ビュー選択ダイアログ（ViewSelectionForm）
+        // ================================================================
+
+        private class ViewSelectionForm : Form
+        {
+            private CheckBox chkAll;
+            private CheckedListBox checkedListBox;
+            private Button btnOk;
+            private Button btnCancel;
+            private bool _updatingAll;
+
+            public List<int> SelectedIndices { get; private set; }
+
+            public ViewSelectionForm(List<ModelingView> views)
+            {
+                SelectedIndices = new List<int>();
+                _updatingAll = false;
+
+                this.Text = GetMessage("ViewSelectTitle");
+                this.FormBorderStyle = FormBorderStyle.FixedDialog;
+                this.MaximizeBox = false;
+                this.MinimizeBox = false;
+                this.StartPosition = FormStartPosition.CenterScreen;
+                this.ShowInTaskbar = true;
+                this.Font = GetUIFont(9f);
+
+                int y = 15;
+
+                // ALL チェックボックス
+                chkAll = new CheckBox();
+                chkAll.Text = GetMessage("ViewSelectAll");
+                chkAll.Location = new System.Drawing.Point(20, y);
+                chkAll.Size = new System.Drawing.Size(350, 25);
+                chkAll.Font = GetUIFont(10f, FontStyle.Bold);
+                chkAll.Checked = true;
+                chkAll.CheckedChanged += ChkAll_CheckedChanged;
+                this.Controls.Add(chkAll);
+                y += 30;
+
+                // 個別ビューリスト
+                checkedListBox = new CheckedListBox();
+                checkedListBox.Location = new System.Drawing.Point(20, y);
+                checkedListBox.Font = GetUIFont(10f);
+                checkedListBox.CheckOnClick = true;
+
+                for (int i = 0; i < views.Count; i++)
+                {
+                    checkedListBox.Items.Add(views[i].Name, true);
+                }
+
+                int listHeight = Math.Min(views.Count * 22 + 5, 300);
+                checkedListBox.Size = new System.Drawing.Size(350, listHeight);
+                checkedListBox.Enabled = false; // ALLがONなので無効化
+                checkedListBox.ItemCheck += CheckedListBox_ItemCheck;
+                this.Controls.Add(checkedListBox);
+                y += listHeight + 15;
+
+                // OKボタン
+                btnOk = new Button();
+                btnOk.Text = GetMessage("OkButton");
+                btnOk.Location = new System.Drawing.Point(120, y);
+                btnOk.Size = new System.Drawing.Size(90, 35);
+                btnOk.Font = GetUIFont(10f);
+                btnOk.Click += BtnOk_Click;
+                this.Controls.Add(btnOk);
+                this.AcceptButton = btnOk;
+
+                // キャンセルボタン
+                btnCancel = new Button();
+                btnCancel.Text = GetMessage("CancelButton");
+                btnCancel.Location = new System.Drawing.Point(220, y);
+                btnCancel.Size = new System.Drawing.Size(90, 35);
+                btnCancel.Font = GetUIFont(10f);
+                btnCancel.Click += (s, e) =>
+                {
+                    this.DialogResult = DialogResult.Cancel;
+                    this.Close();
+                };
+                this.Controls.Add(btnCancel);
+                this.CancelButton = btnCancel;
+
+                y += 55;
+                this.ClientSize = new System.Drawing.Size(390, y);
+            }
+
+            private void BtnOk_Click(object sender, EventArgs e)
+            {
+                SelectedIndices.Clear();
+                if (chkAll.Checked)
+                {
+                    for (int i = 0; i < checkedListBox.Items.Count; i++)
+                        SelectedIndices.Add(i);
+                }
+                else
+                {
+                    for (int i = 0; i < checkedListBox.Items.Count; i++)
+                    {
+                        if (checkedListBox.GetItemChecked(i))
+                            SelectedIndices.Add(i);
+                    }
+                }
+                this.DialogResult = DialogResult.OK;
+                this.Close();
+            }
+
+            private void ChkAll_CheckedChanged(object sender, EventArgs e)
+            {
+                _updatingAll = true;
+                if (chkAll.Checked)
+                {
+                    checkedListBox.Enabled = false;
+                    for (int i = 0; i < checkedListBox.Items.Count; i++)
+                        checkedListBox.SetItemChecked(i, true);
+                }
+                else
+                {
+                    checkedListBox.Enabled = true;
+                }
+                UpdateOkButton();
+                _updatingAll = false;
+            }
+
+            private void CheckedListBox_ItemCheck(object sender, ItemCheckEventArgs e)
+            {
+                if (_updatingAll) return;
+
+                // チェック変更後のカウントを計算
+                int checkedCount = checkedListBox.CheckedItems.Count;
+                if (e.NewValue == CheckState.Checked)
+                    checkedCount++;
+                else if (e.NewValue == CheckState.Unchecked)
+                    checkedCount--;
+
+                // 全てチェックされたらALLを自動ON
+                if (checkedCount == checkedListBox.Items.Count)
+                {
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        if (!chkAll.Checked)
+                            chkAll.Checked = true;
+                    }));
+                }
+
+                // 1つもチェックがなければOKを無効化
+                btnOk.Enabled = checkedCount > 0;
+            }
+
+            private void UpdateOkButton()
+            {
+                if (chkAll.Checked)
+                {
+                    btnOk.Enabled = true;
+                    return;
+                }
+
+                bool anyChecked = false;
+                for (int i = 0; i < checkedListBox.Items.Count; i++)
+                {
+                    if (checkedListBox.GetItemChecked(i))
+                    {
+                        anyChecked = true;
+                        break;
+                    }
+                }
+                btnOk.Enabled = anyChecked;
+            }
+        }
+    }
+}
