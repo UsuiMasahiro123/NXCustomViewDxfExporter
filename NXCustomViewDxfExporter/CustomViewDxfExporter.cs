@@ -454,7 +454,7 @@ namespace NXCustomViewDxfExporter
             DrawingSheet exportSheet = null;
             try
             {
-                exportSheet = CreateSheet(sheetW, sheetH);
+                exportSheet = CreateSheet(sheetW, sheetH, SanitizeFileName(view.Name));
                 exportSheet.Open();
                 workPart.Drafting.SetTemplateInstantiationIsComplete(true);
 
@@ -468,7 +468,7 @@ namespace NXCustomViewDxfExporter
 
                 // ★デバッグモード：無効（DXFエクスポートを実行）
                 // DXFエクスポート
-                PerformDxfExport(dxfPath);
+                PerformDxfExport(dxfPath, exportSheet);
 
                 // DXF後処理：フォントサイズをPMIから反映
                 PostProcessDxfFontSizes(dxfPath, pmiFontMap);
@@ -522,7 +522,7 @@ namespace NXCustomViewDxfExporter
         // 図面シート作成
         // ================================================================
 
-        private static DrawingSheet CreateSheet(double width, double height)
+        private static DrawingSheet CreateSheet(double width, double height, string sheetName = null)
         {
             DraftingDrawingSheet nullSheet = null;
             var builder = workPart.DraftingDrawingSheets.CreateDraftingDrawingSheetBuilder(nullSheet);
@@ -534,6 +534,8 @@ namespace NXCustomViewDxfExporter
             builder.ScaleDenominator = 1.0;
             builder.Units = DrawingSheetBuilder.SheetUnits.Metric;
             builder.ProjectionAngle = DrawingSheetBuilder.SheetProjectionAngle.Third;
+            if (!string.IsNullOrEmpty(sheetName))
+                builder.Name = sheetName;
 
             NXObject sheetObj = builder.Commit();
             builder.Destroy();
@@ -823,7 +825,7 @@ namespace NXCustomViewDxfExporter
         // DXFエクスポート（★【改修4】Freeze/Unfreezeで確実に囲む）
         // ================================================================
 
-        private static void PerformDxfExport(string dxfPath)
+        private static void PerformDxfExport(string dxfPath, DrawingSheet sheet = null)
         {
             DxfdwgCreator creator = theSession.DexManager.CreateDxfdwgCreator();
 
@@ -837,7 +839,9 @@ namespace NXCustomViewDxfExporter
                 creator.ViewEditMode = false;
                 creator.ExportScaleValue = 1.0;
                 creator.LayerMask = "1-256";
-                creator.DrawingList = "_ALL_";
+                creator.DrawingList = (sheet != null)
+                    ? string.Format(@"""{0}""", sheet.Name)
+                    : "_ALL_";
                 creator.ProcessHoldFlag = true;
                 creator.WidthFactorMode = DxfdwgCreator.WidthfactorMethodOptions.AutomaticCalculation;
 
