@@ -524,6 +524,22 @@ namespace NXCustomViewDxfExporter
 
         private static DrawingSheet CreateSheet(double width, double height, string sheetName = null)
         {
+            // PMIトラッキングを継承: モデリングのフォントサイズを製図に引き継ぐ
+            NXOpen.Annotations.PmiTrackingPropertiesBuilder pmiTrackingBuilder =
+                workPart.Annotations.CreatePmiTrackingPropertiesBuilder();
+            try
+            {
+                pmiTrackingBuilder.SetPmiTrackingPropertyStatus("DimensionTextCharacterSize", true);
+                pmiTrackingBuilder.SetPmiTrackingPropertyStatus("ToleranceTextCharacterSize", true);
+                pmiTrackingBuilder.SetPmiTrackingPropertyStatus("AppendedTextCharacterSize", true);
+                pmiTrackingBuilder.SetPmiTrackingPropertyStatus("GeneralTextCharacterSize", true);
+                pmiTrackingBuilder.Commit();
+            }
+            finally
+            {
+                pmiTrackingBuilder.Destroy();
+            }
+
             DraftingDrawingSheet nullSheet = null;
             var builder = workPart.DraftingDrawingSheets.CreateDraftingDrawingSheetBuilder(nullSheet);
             builder.AutoStartViewCreation = false;
